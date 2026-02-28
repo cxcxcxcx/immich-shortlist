@@ -1,0 +1,30 @@
+---
+description: Let exceptions raise; never catch. Worst-case fallback is silent cache/skip.
+alwaysApply: true
+---
+
+# Exceptions and Fallbacks
+
+- **Let exceptions raise.** Do not catch exceptions; allow them to propagate so failures are visible and debuggable.
+- **Never swallow errors** with bare `except:` or `except Exception:` that then continue or return a default without re-raising.
+- **Worst-case fallback:** When you must handle an optional or best-effort path (e.g. missing cache, optional API), the worst acceptable behavior is a **silent** fallback: use a cached value, skip the step, or no-op. Do not add try/except that logs and continues; prefer to either let the exception raise or to check preconditions and skip silently (e.g. "if not cached: return" or "if path exists: use it").
+
+### Examples
+
+```python
+# ❌ BAD: catch and continue
+try:
+    score = compute_expression(img, asset)
+except Exception as e:
+    logger.warning(f"Expression failed: {e}")
+    score = 0.0
+
+# ✅ GOOD: let it raise
+score = compute_expression(img, asset)
+
+# ✅ OK: optional feature, silent skip
+def optional_enhancement(data):
+    if not _cache.has(key):
+        return  # silent skip, no exception
+    use(_cache.get(key))
+```
