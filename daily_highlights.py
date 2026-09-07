@@ -9,6 +9,8 @@ for variety, and presents the top choices in a local web UI for final
 confirmation before adding them to an album.
 """
 
+import argparse
+import calendar
 import os
 import tempfile
 import io
@@ -18,6 +20,7 @@ import requests
 import datetime
 import threading
 import webbrowser
+from zoneinfo import ZoneInfo
 from PIL import Image
 
 # ML / evaluation
@@ -34,10 +37,10 @@ from flask import Flask, render_template_string, request, redirect, url_for
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# Replace these with your actual Immich details
-IMMICH_URL = "http://localhost:2283"
-API_KEY = "69T5wx39HYcNg2DyfM3Yvz0IQOY5hTtBREGjAzjXNw"
-ALBUM_ID = "fced049d-52dc-4fc0-aa50-8962dc4506d2"
+from config import IMMICH_URL, API_KEY, ALBUM_ID, LOCAL_TZ_NAME
+
+# Local timezone used to interpret date boundaries (inclusive days).
+LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
 
 # List of Face/Person UUIDs to search for
 FACE_IDS = [
@@ -56,8 +59,8 @@ FAMILY_FACES = [
 
 # Date Range for curation (fixed for fast demo)
 # Here we only process a single day: 2026-02-18.
-START_DATE = datetime.date(2026, 2, 1)
-END_DATE = datetime.date(2026, 2, 25)
+START_DATE = datetime.date(2026, 12, 1)
+END_DATE = datetime.date(2026, 12, 31)
 
 # Combined score threshold (quality + expression). Currently unused (we always take top per cluster),
 # but kept for future tuning.
@@ -149,10 +152,25 @@ def search_assets_for_date(target_date, person_ids):
     explicitly OR across IDs by issuing one query per person and unioning results.
     """
     print(f"[{target_date}] Searching for assets...")
-    
-    # Format dates to UTC ISO format required by Immich
-    start_time = datetime.datetime.combine(target_date, datetime.time.min).isoformat() + 'Z'
-    end_time = datetime.datetime.combine(target_date, datetime.time.max).isoformat() + 'Z'
+
+    # Interpret the calendar date in the local timezone, then convert to UTC
+    # for the Immich API's takenAfter/takenBefore filters.
+    local_start = datetime.datetime.combine(
+        target_date, datetime.time.min, tzinfo=LOCAL_TZ
+    )
+    local_end = datetime.datetime.combine(
+        target_date, datetime.time.max, tzinfo=LOCAL_TZ
+    )
+    start_time = (
+        local_start.astimezone(datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+    end_time = (
+        local_end.astimezone(datetime.timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
 
     all_assets: dict[str, dict] = {}
     for pid in person_ids:
@@ -1240,7 +1258,7 @@ TOP_TEMPLATE = """
                 {% for date, assets in data.items() %}
                     <div class="date-section">
                         <h2 class="date-title">
-                            {{ date }} ({{ assets|length }} top photos)
+                            {{ date }} ({{ assets|length }} photos)
                             <a class="deep-link" href="/date/{{ date }}">Deep view for this day</a>
                         </h2>
                         <div class="grid">
@@ -1288,7 +1306,7 @@ def process():
 
 @app.route('/top')
 def top():
-    """Show top photo from each cluster per day."""
+    """Show top photo from each cluster per day, plus any selected non-tops."""
     top_by_date = {}
     for date, assets in curated_assets_by_date.items():
         # pick best asset per cluster by final score
@@ -1304,7 +1322,14 @@ def top():
             best_per_cluster.values(),
             key=lambda x: -(x.get("_final_score", x.get("_total_score", 0.0))),
         )
-        top_by_date[date] = tops
+        top_ids = {a.get("id") for a in tops if a.get("id")}
+        # add selected assets that are not cluster tops so they appear and get added to album
+        date_asset_ids = {a.get("id") for a in assets if a.get("id")}
+        selected_on_date = selected_asset_ids & date_asset_ids
+        extra_ids = selected_on_date - top_ids
+        id_to_asset = {a.get("id"): a for a in assets if a.get("id")}
+        extra = [id_to_asset[aid] for aid in extra_ids if aid in id_to_asset]
+        top_by_date[date] = tops + extra
     # Derive selection for top page:
     # - start from global selected_asset_ids (may have been updated via deep view)
     # - if nothing is selected yet, apply the default threshold rule to top photos
@@ -1328,13 +1353,34 @@ def top():
 
 @app.route('/clusters')
 def clusters():
-    """Cluster debug view with all ranked assets."""
+    """Cluster debug view with all ranked assets. Sorted by cluster then by top score (best first)."""
     def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
         return _render_asset_card_body(asset, build_score_line, cluster_rank, show_base, show_badges)
 
+    # Per date: sort by cluster top score (so best clusters first), then by score within cluster
+    def _sorted_assets(assets):
+        cluster_top = {}
+        for a in assets:
+            cid = a.get("_cluster_id", -1)
+            s = a.get("_final_score", a.get("_total_score", 0.0))
+            cluster_top[cid] = max(cluster_top.get(cid, s), s)
+        return sorted(
+            assets,
+            key=lambda a: (
+                -cluster_top.get(a.get("_cluster_id", -1), 0.0),
+                a.get("_cluster_id", -1),
+                -(a.get("_final_score", a.get("_total_score", 0.0))),
+            ),
+        )
+
+    sorted_data = {
+        date: _sorted_assets(assets)
+        for date, assets in curated_assets_by_date.items()
+    }
+
     return render_template_string(
         CLUSTERS_TEMPLATE,
-        data=curated_assets_by_date,
+        data=sorted_data,
         selected_ids=selected_asset_ids,
         score_line=build_score_line,
         card_body_html=_card_body,
@@ -1422,13 +1468,58 @@ def confirm():
 # ==========================================
 # 5. ENTRY POINT
 # ==========================================
+def _parse_month(month_str: str) -> tuple[datetime.date, datetime.date]:
+    """Parse 'YYYY-MM' into (first_day, last_day) of that month."""
+    year, month = map(int, month_str.split("-"))
+    first = datetime.date(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    last = datetime.date(year, month, last_day)
+    return first, last
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Immich Album Curator: curate photos by date range and add to album.",
+    )
+    parser.add_argument(
+        "--month",
+        metavar="YYYY-MM",
+        help="Process one month of photos and add selected photos to the album (no UI). Example: --month 2026-02",
+    )
+    parser.add_argument(
+        "--skip-in-album",
+        action="store_true",
+        help="With --month: skip dates whose candidates are already in the album.",
+    )
+    args = parser.parse_args()
+
     print("========================================")
     print(" Immich AI Album Curator ")
     print("========================================\n")
-    
+
     if API_KEY == "YOUR_API_KEY_HERE":
         print("ERROR: Please update the API_KEY, IMMICH_URL, and ALBUM_ID variables inside the script first.")
         exit(1)
+
+    if args.month:
+        start_date, end_date = _parse_month(args.month)
+        print(f"Processing month {args.month} ({start_date} to {end_date})...")
+        run_curation_for_date_range(
+            start_date,
+            end_date,
+            skip_dates_already_in_album=args.skip_in_album,
+        )
+        selected_ids = list(selected_asset_ids)
+        if not selected_ids:
+            print("No photos selected. Nothing to add to the album.")
+            exit(0)
+        print(f"Adding {len(selected_ids)} selected assets to album {ALBUM_ID}...")
+        success = add_assets_to_album(ALBUM_ID, selected_ids)
+        if success:
+            print(f"Successfully added {len(selected_ids)} assets to the album.")
+        else:
+            print("Failed to add assets to the album.")
+            exit(1)
+        exit(0)
 
     app.run(port=FLASK_PORT, debug=True, use_reloader=True)

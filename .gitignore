@@ -8,3 +8,8 @@ wheels/
 
 # Virtual environments
 .venv
+
+# MediaPipe / TFLite model artifacts (downloaded, see daily_highlights.py header)
+*.task
+*.task.*
+*.tflite
