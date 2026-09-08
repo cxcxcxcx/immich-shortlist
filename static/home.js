@@ -188,9 +188,10 @@
             rangeEl.textContent = (s.start_date || '') + ' → ' + (s.end_date || '');
             const pct = s.days_total ? Math.round(100 * s.days_done / s.days_total) : 0;
             bar.style.width = pct + '%';
-            const assets = s.assets_total ? ' · photo ' + s.assets_done + '/' + s.assets_total : '';
-            textEl.textContent = 'Day ' + Math.min(s.days_done + 1, s.days_total) + '/' + s.days_total +
-                ' — ' + (s.current_date || '') + assets + ' · ' + fmtSecs(s.elapsed_sec || 0) + ' elapsed';
+            const rescoring = s.phase === 'rescore';
+            const assets = rescoring ? '' : (s.assets_total ? ' · photo ' + s.assets_done + '/' + s.assets_total : '');
+            const prefix = rescoring ? 'Re-scoring' : 'Day ' + Math.min(s.days_done + 1, s.days_total) + '/' + s.days_total;
+            textEl.textContent = prefix + ' — ' + (s.current_date || '') + assets + ' · ' + fmtSecs(s.elapsed_sec || 0) + ' elapsed';
             setTimeout(poll, 2000);
         } else if (s.state === 'done') {
             if (armed) {

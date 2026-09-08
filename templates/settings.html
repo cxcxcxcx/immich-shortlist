@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}Settings — Photo Curator{% endblock %}
+{% block container_class %}container-narrow{% endblock %}
+{% block content %}
+<div class="page-head">
+    <h1>Scoring settings</h1>
+    <p>Applies to the next curation run or re-score. Saved to curation_params.json.</p>
+</div>
+
+{% if saved %}<div class="banner banner-success"><span>Settings saved.</span></div>{% endif %}
+{% if errors %}<div class="banner banner-warn"><span>
+    <ul class="error-list">{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</span></div>{% endif %}
+{% if running %}<div class="banner banner-warn"><span>A job is running ({{ phase or 'curation' }}) —
+    saved settings apply to the one after it.</span></div>{% endif %}
+
+<form method="POST" action="{{ url_for('settings') }}" class="settings-stack" data-settings-form>
+    {% for title, hint, names in groups %}
+    <section class="card card-pad">
+        <h2 class="section-title">{{ title }}</h2>
+        <p class="form-hint">{{ hint }}</p>
+        <div class="form-grid">
+            {% for name in names %}{% set s = specs[name] %}
+            <div class="form-field">
+                <label class="form-label" for="{{ name }}">{{ s.label }}</label>
+                <input class="input" type="number" id="{{ name }}" name="{{ name }}"
+                       value="{{ (form_values.get(name) if form_values else params[name]) }}"
+                       step="{{ s.step }}" min="{{ s.min }}" max="{{ s.max }}" inputmode="decimal">
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% endfor %}
+
+    <section class="card card-pad">
+        <h2 class="section-title">Faces</h2>
+        {% for field, label, desc in face_sets %}
+        <div class="form-group">
+            <span class="form-label">{{ label }}</span>
+            <p class="form-hint">{{ desc }}</p>
+            {% if people %}
+            <div class="people-grid" data-face-group="{{ field }}">
+                {% for p in people %}
+                <label class="people-tile">
+                    <input type="checkbox" name="{{ field }}" value="{{ p.id }}"
+                           {% if p.id in (form_values.get(field) if form_values else params[field]) %}checked{% endif %}>
+                    <img class="people-thumb" src="{{ url_for('serve_person_thumbnail', person_id=p.id) }}"
+                         alt="" loading="lazy" onerror="this.style.display='none'">
+                    <span class="people-name">{{ p.name }}</span>
+                </label>
+                {% endfor %}
+            </div>
+            <div class="chip-row">
+                <button type="button" class="chip js-face-all" data-for="{{ field }}">All</button>
+                <button type="button" class="chip js-face-none" data-for="{{ field }}">None</button>
+            </div>
+            {% else %}
+            <input class="input" type="text" name="{{ field }}_text" placeholder="comma-separated person UUIDs"
+                   value="{{ (form_values.get(field) if form_values else params[field])|join(', ') }}">
+            <p class="form-hint">Couldn't reach Immich's people list — paste UUIDs.</p>
+            {% endif %}
+        </div>
+        {% endfor %}
+    </section>
+
+    <section class="card card-pad">
+        <h2 class="section-title">Cache status</h2>
+        <p class="form-hint">{{ cache_stats.total }} cached photos · {{ cache_stats.boxes }} with per-face
+            data (face-set changes apply on re-score) · {{ cache_stats.total - cache_stats.boxes - cache_stats.full }}
+            still need a one-time face backfill.</p>
+    </section>
+
+    <div class="action-bar">
+        <div class="action-info">Changes apply to the next run / re-score</div>
+        <button type="submit" class="btn btn-primary">Save settings</button>
+    </div>
+</form>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='settings.js') }}"></script>{% endblock %}

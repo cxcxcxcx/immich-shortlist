@@ -6,6 +6,38 @@
     <p>Best photo of each cluster per day. Selections stay in sync with the deep views.</p>
 </div>
 
+{% if data %}
+<div class="card card-pad rescore-card">
+    <div class="rescore-row">
+        <div>
+            <h2 class="section-title">Re-score with current settings</h2>
+            <p class="form-hint">Recomputes scores &amp; clusters from cached features — no ML re-run. Your
+                selection is kept.</p>
+            <p class="mini">Scored with: {{ rescore.params.face_ids|length }} primary ·
+                {{ rescore.params.family_faces|length }} family faces ·
+                quality {{ rescore.params.quality_weight }} / expression {{ rescore.params.expression_weight }} /
+                person {{ rescore.params.person_weight }} ·
+                <a href="{{ url_for('settings') }}">Edit settings</a></p>
+            {% if rescore.settings_differ %}<div class="banner banner-warn"><span>Settings changed since these
+                scores were computed — re-score to apply them.</span></div>{% endif %}
+            {% if rescore.backfill_needed %}<p class="mini">First pass analyzes {{ rescore.backfill_needed }}
+                photo(s) for faces — this one is slow; try a single day first.</p>{% endif %}
+        </div>
+        <form method="POST" action="{{ url_for('rescore') }}" class="rescore-actions">
+            <select name="date" class="input" aria-label="Scope">
+                <option value="">All {{ rescore.days|length }} day(s)</option>
+                {% for d in rescore.days %}<option value="{{ d }}">{{ d }}</option>{% endfor %}
+            </select>
+            <button type="submit" class="btn btn-primary" {% if rescore.running %}disabled{% endif %}>Re-score</button>
+        </form>
+    </div>
+    <div id="rescore-progress" style="display:none">
+        <div class="bar-track"><div id="rescore-bar" class="bar-fill active"></div></div>
+        <p id="rescore-text" class="form-hint"></p>
+    </div>
+</div>
+{% endif %}
+
 {% if not data %}
 <div class="card"><div class="empty-state">
     <h2>No photos for this range yet</h2>
@@ -37,4 +69,7 @@
 </form>
 {% endif %}
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', filename='gallery.js') }}"></script>{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='gallery.js') }}"></script>
+<script src="{{ url_for('static', filename='rescore.js') }}"></script>
+{% endblock %}

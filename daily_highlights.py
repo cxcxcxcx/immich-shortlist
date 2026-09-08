@@ -11,9 +11,11 @@ confirmation before adding them to an album.
 
 import argparse
 import calendar
+import copy
 import os
 import io
 import json
+import re
 import time
 import base64
 import requests
@@ -55,35 +57,234 @@ FAMILY_FACES = [
     "8300f245-08e9-422d-8f90-96910cbd04bd",
 ]
 
-# Global normalization parameters (tunable; initial guesses):
-# - MUSIQ quality scores we observe are typically ~60–74
-# - expression scores in roughly [-0.5, 1.0]
-QUALITY_MEAN = 65.0
-QUALITY_STD = 6
-EXPRESSION_MEAN = 0.25
-EXPRESSION_STD = 0.3
+# ==========================================
+# TUNABLE PARAMETERS (UI-editable via /settings)
+# ==========================================
+# All scoring knobs live in one dict, persisted in curation_params.json and
+# editable from the settings page. Scoring code must read params from the
+# snapshot handed to it (jobs take snapshot_params()), never from here
+# directly, so a run keeps one consistent config even if settings change
+# mid-run. The old module-level constants were folded into DEFAULT_PARAMS.
+DEFAULT_PARAMS: dict = {
+    # Combined score: total = w_q·q_norm + w_e·e_norm + person_boost + boosts
+    "quality_weight": 0.4,
+    "expression_weight": 0.2,
+    "person_weight": 0.2,
+    # Global normalization (z-score): MUSIQ raw quality is typically ~60–74,
+    # expression scores land in roughly [-0.5, 1.0].
+    "quality_mean": 65.0,
+    "quality_std": 6.0,
+    "expression_mean": 0.25,
+    "expression_std": 0.3,
+    # Expression per-face sub-weights: expr = w_eyes·eyes + w_smile·smile + w_facing·facing
+    "expr_w_eyes": 0.5,
+    "expr_w_smile": 0.2,
+    "expr_w_facing": 0.3,
+    # Family boost: per family face with facing >= min, add discount·(w·eyes + w·smile + w·facing)
+    "family_facing_min": 0.75,
+    "family_boost_discount": 0.5,
+    "family_boost_weight_eyes": 0.25,
+    "family_boost_weight_smile": 0.25,
+    "family_boost_weight_facing": 0.5,
+    # Clustering: CLIP cosine threshold (higher = fewer, tighter clusters) and
+    # the cluster-top bonus that grows with cluster size and saturates.
+    "clip_cluster_sim_threshold": 0.9,
+    "cluster_top_weight": 0.5,
+    "cluster_top_max_size": 8,
+    "max_clusters_per_day": 20,
+    # Default selection: which cluster tops are pre-checked when the user has
+    # not hand-picked anything.
+    "default_min_final_score": 1.0,
+    "default_min_top_clusters": 6,
+    # Face sets: primary people are searched in Immich and drive the main
+    # expression score; family people contribute the family boost.
+    "face_ids": list(FACE_IDS),
+    "family_faces": list(FAMILY_FACES),
+}
 
-# Weights for combined score: total_base = QUALITY_WEIGHT * quality_norm
-#   + EXPRESSION_WEIGHT * expression_norm
-#   + PERSON_WEIGHT * (person_match_count - 1)
-QUALITY_WEIGHT = 0.4
-EXPRESSION_WEIGHT = 0.2
-PERSON_WEIGHT = 0.2
-# Family boost: continuous smile, eyes_open, facing (facing weighted higher).
-# Only count a family face if facing >= FAMILY_FACING_MIN; each face's score is discounted by 0.5.
-FAMILY_FACING_MIN = 0.75
-FAMILY_BOOST_DISCOUNT = 0.5
-FAMILY_BOOST_WEIGHT_EYES = 0.25
-FAMILY_BOOST_WEIGHT_SMILE = 0.25
-FAMILY_BOOST_WEIGHT_FACING = 0.5
+PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_params.json")
 
-# CLIP clustering similarity threshold (cosine). Higher = fewer, tighter clusters.
-CLIP_CLUSTER_SIM_THRESHOLD = 0.9
+# Spec table driving both validation and the settings form rendering.
+PARAM_SPECS: dict[str, dict] = {
+    name: spec
+    for name, spec in {
+        "quality_weight": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Quality weight"),
+        "expression_weight": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Expression weight"),
+        "person_weight": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Person boost weight"),
+        "quality_mean": dict(kind="float", min=-1000.0, max=1000.0, step=0.5, label="Quality mean"),
+        "quality_std": dict(kind="float", min=0.05, max=1000.0, step=0.05, label="Quality std (> 0)"),
+        "expression_mean": dict(kind="float", min=-10.0, max=10.0, step=0.05, label="Expression mean"),
+        "expression_std": dict(kind="float", min=0.02, max=10.0, step=0.02, label="Expression std (> 0)"),
+        "expr_w_eyes": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Expr weight: eyes"),
+        "expr_w_smile": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Expr weight: smile"),
+        "expr_w_facing": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Expr weight: facing"),
+        "family_facing_min": dict(kind="float", min=0.0, max=1.0, step=0.05, label="Family facing min"),
+        "family_boost_discount": dict(kind="float", min=0.0, max=2.0, step=0.05, label="Family boost discount"),
+        "family_boost_weight_eyes": dict(kind="float", min=0.0, max=2.0, step=0.05, label="Family weight: eyes"),
+        "family_boost_weight_smile": dict(kind="float", min=0.0, max=2.0, step=0.05, label="Family weight: smile"),
+        "family_boost_weight_facing": dict(kind="float", min=0.0, max=2.0, step=0.05, label="Family weight: facing"),
+        "clip_cluster_sim_threshold": dict(kind="float", min=0.0, max=1.0, step=0.01, label="Cluster similarity threshold"),
+        "cluster_top_weight": dict(kind="float", min=0.0, max=10.0, step=0.05, label="Cluster-top bonus weight"),
+        "cluster_top_max_size": dict(kind="int", min=1, max=1000, step=1, label="Cluster-top saturating size"),
+        "max_clusters_per_day": dict(kind="int", min=1, max=500, step=1, label="Max clusters per day"),
+        "default_min_final_score": dict(kind="float", min=-100.0, max=100.0, step=0.05, label="Default min final score"),
+        "default_min_top_clusters": dict(kind="int", min=0, max=200, step=1, label="Default min top clusters"),
+    }.items()
+}
 
-# Cluster-top boost: extra score for the top-ranked photo in each cluster.
-# The boost grows with cluster size but saturates as size increases.
-CLUSTER_TOP_WEIGHT = 0.5
-CLUSTER_TOP_MAX_SIZE = 8
+# Settings-page sections: (heading, hint, field names in display order).
+PARAM_GROUPS: list[tuple[str, str, list[str]]] = [
+    ("Score weights",
+     "total = w_q·q_norm + w_e·e_norm + person_boost + family_boost + cluster_top_bonus",
+     ["quality_weight", "expression_weight", "person_weight"]),
+    ("Normalization",
+     "Quality and expression are z-scored with these mean/std before weighting",
+     ["quality_mean", "quality_std", "expression_mean", "expression_std"]),
+    ("Expression sub-weights",
+     "Per-face expression = w_eyes·eyes + w_smile·smile + w_facing·facing",
+     ["expr_w_eyes", "expr_w_smile", "expr_w_facing"]),
+    ("Family boost",
+     "Each family face with facing ≥ min adds discount·(w_eyes·eyes + w_smile·smile + w_facing·facing)",
+     ["family_facing_min", "family_boost_discount", "family_boost_weight_eyes",
+      "family_boost_weight_smile", "family_boost_weight_facing"]),
+    ("Clustering",
+     "CLIP cosine similarity groups near-duplicates; top of each cluster gets a saturating bonus",
+     ["clip_cluster_sim_threshold", "cluster_top_weight", "cluster_top_max_size", "max_clusters_per_day"]),
+    ("Default selection",
+     "Cluster tops pre-checked when nothing is hand-picked",
+     ["default_min_final_score", "default_min_top_clusters"]),
+]
+
+# Face-set pickers: (params key, label, description).
+FACE_SETS: tuple[tuple[str, str, str], ...] = (
+    ("face_ids", "Primary faces",
+     "Searched in Immich and drive the main expression score"),
+    ("family_faces", "Family faces",
+     "Contribute the family boost"),
+)
+
+_FACE_PARAM_NAMES = ("face_ids", "family_faces")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+_params: dict = copy.deepcopy(DEFAULT_PARAMS)
+_last_scored_params: dict | None = None  # snapshot used by the most recent run/rescore
+
+
+def snapshot_params() -> dict:
+    """Deep copy of the live settings; jobs score against an immutable snapshot."""
+    return copy.deepcopy(_params)
+
+
+def params_fingerprint(params: dict | None = None) -> str:
+    """Stable string for comparing two param sets (used by the re-score banner)."""
+    return json.dumps(params if params is not None else _params, sort_keys=True)
+
+
+def _coerce_field(name: str, raw) -> tuple[bool, object, str]:
+    """Parse one numeric field per its spec. Returns (ok, value, error)."""
+    spec = PARAM_SPECS[name]
+    try:
+        if spec["kind"] == "float":
+            value = float(raw)
+        else:
+            value = int(float(raw))
+    except (TypeError, ValueError):
+        return False, None, f"{spec['label']}: '{raw}' is not a number"
+    if not (spec["min"] <= value <= spec["max"]):
+        return False, None, f"{spec['label']} must be between {spec['min']} and {spec['max']}"
+    return True, value, ""
+
+
+def _clean_face_ids(ids) -> tuple[list[str], list[str]]:
+    """Lowercase, validate and de-duplicate person ids. Returns (clean, errors)."""
+    errors: list[str] = []
+    out: list[str] = []
+    for raw in ids or []:
+        pid = str(raw).strip().lower()
+        if not pid:
+            continue
+        if not _UUID_RE.match(pid):
+            errors.append(f"'{pid}' is not a valid person id")
+            continue
+        if pid not in out:
+            out.append(pid)
+    return out, errors
+
+
+def sanitize_faces(face_ids, family_faces) -> tuple[list[str], list[str], list[str]]:
+    """Clean the two face sets. Returns (face_ids, family_faces, errors).
+
+    An id in both sets stays primary (matching the classifier's precedence) and
+    is dropped from family. At least one primary face is required; family may be
+    empty. Unknown-but-well-formed ids are kept: Immich may know people we did
+    not page through.
+    """
+    face_ids, errors = _clean_face_ids(face_ids)
+    family_faces, fam_errors = _clean_face_ids(family_faces)
+    errors.extend(fam_errors)
+    family_faces = [pid for pid in family_faces if pid not in face_ids]
+    if not face_ids:
+        errors.append("Pick at least one primary face")
+    return face_ids, family_faces, errors
+
+
+def sanitize_params(raw: dict, face_ids=None, family_faces=None) -> tuple[dict | None, list[str]]:
+    """Validate a raw dict (form data or curation_params.json).
+
+    Numeric fields come from `raw`; the face sets from the explicit args when
+    given (form checkboxes/text fallback), else from `raw` (settings file).
+    Returns (params, errors).
+    """
+    errors: list[str] = []
+    params = dict(DEFAULT_PARAMS)
+    for name, spec in PARAM_SPECS.items():
+        if name not in raw or raw[name] in ("", None):
+            errors.append(f"{spec['label']} is missing")
+            continue
+        ok, value, err = _coerce_field(name, raw[name])
+        if not ok:
+            errors.append(err)
+        else:
+            params[name] = value
+    if face_ids is None:
+        face_ids = raw.get("face_ids")
+    if family_faces is None:
+        family_faces = raw.get("family_faces")
+    f_ids, fam_ids, face_errors = sanitize_faces(face_ids, family_faces)
+    errors.extend(face_errors)
+    params["face_ids"] = f_ids
+    params["family_faces"] = fam_ids
+    if errors:
+        return None, errors
+    return params, []
+
+
+def load_params() -> None:
+    """Load settings from disk at import; invalid files fall back to defaults."""
+    global _params
+    if not os.path.exists(PARAMS_PATH):
+        return
+    try:
+        with open(PARAMS_PATH) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as exc:
+        print(f"Could not read {PARAMS_PATH} ({exc}); using default params.")
+        return
+    params, errors = sanitize_params(data)
+    if params is None:
+        print(f"Ignoring invalid {PARAMS_PATH}: {errors[:3]}")
+        return
+    _params = params
+    print(f"Loaded scoring params from {os.path.basename(PARAMS_PATH)}.")
+
+
+def save_params() -> None:
+    """Atomically persist the live settings."""
+    tmp = PARAMS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(_params, f, indent=1, sort_keys=True)
+    os.replace(tmp, PARAMS_PATH)
+
 
 # Flask app configuration
 FLASK_PORT = 5724
@@ -104,9 +305,6 @@ app = Flask(__name__)
 curated_assets_by_date = {}
 # Tracks which asset IDs are currently selected in the UI
 selected_asset_ids = set()
-# Default selection behaviour
-DEFAULT_MIN_FINAL_SCORE = 1.0
-DEFAULT_MIN_TOP_CLUSTERS = 6
 # Lazy-loaded models (loaded on first /process)
 _models_cache = None
 _musiq_metric = None
@@ -115,10 +313,15 @@ _faces_cache: dict[str, list[dict]] = {}
 # In-memory thumbnail cache (Immich thumbnails are immutable per asset id).
 _thumb_cache: dict[str, tuple[bytes, str]] = {}
 _thumb_lock = threading.Lock()
+# People list + avatar cache for the settings face pickers.
+_people_cache: dict | None = None  # {"fetched_at": float, "people": [{"id","name"}]}
+_people_lock = threading.Lock()
+_person_thumb_cache: dict[str, tuple[bytes, str]] = {}
 # Live progress of a curation run (written by the job thread, read by /progress).
 CURATION_LOCK = threading.Lock()
 CURATION_STATE = {
     "state": "idle",  # idle | running | done | cancelled | error
+    "phase": "",  # curation | rescore
     "days_total": 0,
     "days_done": 0,
     "current_date": "",
@@ -137,12 +340,14 @@ CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cura
 _checkpoint_info: dict | None = None
 
 
-def save_checkpoint(submitted: bool = False) -> None:
-    """Atomically write curated results + selection to disk."""
+def save_checkpoint(submitted: bool = False, params: dict | None = None) -> None:
+    """Atomically write curated results + selection + the scoring params to disk."""
     global _checkpoint_info
+    scored_params = params or _last_scored_params or snapshot_params()
     data = {
         "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
         "submitted": submitted,
+        "params": scored_params,
         "curated_assets_by_date": curated_assets_by_date,
         "selected_asset_ids": sorted(selected_asset_ids),
     }
@@ -154,6 +359,7 @@ def save_checkpoint(submitted: bool = False) -> None:
         "days": len(curated_assets_by_date),
         "saved_at": data["saved_at"],
         "submitted": submitted,
+        "params": scored_params,
     }
 
 
@@ -170,6 +376,7 @@ def load_checkpoint() -> None:
         "days": len(curated_assets_by_date),
         "saved_at": data.get("saved_at", ""),
         "submitted": bool(data.get("submitted")),
+        "params": data.get("params"),  # None for pre-params checkpoints -> defaults
     }
     print(
         f"Restored checkpoint from {_checkpoint_info['saved_at']} "
@@ -193,7 +400,11 @@ def discard_checkpoint() -> None:
 # pay inference cost again. Bump the version when models or preprocessing
 # change.
 FEATURE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_cache.json")
-FEATURE_CACHE_VERSION = 1
+# v2 adds per-face raw rows ("faces") so expression/family scores can be
+# re-aggregated under new params or face sets without re-running MediaPipe.
+# v1 files are still accepted: entries without "faces" are backfilled lazily.
+FEATURE_CACHE_VERSION = 2
+SUPPORTED_CACHE_VERSIONS = (1, 2)
 _feature_cache: dict[str, dict] = {}
 _feature_lock = threading.Lock()
 
@@ -204,23 +415,31 @@ def load_feature_cache() -> None:
         return
     with open(FEATURE_CACHE_PATH) as f:
         data = json.load(f)
-    if data.get("version") != FEATURE_CACHE_VERSION:
-        print(f"Ignoring feature cache version {data.get('version')} (want {FEATURE_CACHE_VERSION}).")
+    if data.get("version") not in SUPPORTED_CACHE_VERSIONS:
+        print(f"Ignoring feature cache version {data.get('version')} (want {SUPPORTED_CACHE_VERSIONS}).")
         return
     _feature_cache = data.get("assets", {})
-    print(f"Loaded feature cache: {len(_feature_cache)} assets.")
+    print(f"Loaded feature cache: {len(_feature_cache)} assets (v{data.get('version')}).")
 
 
 def save_feature_cache() -> None:
-    """Atomically persist the per-asset feature cache."""
+    """Atomically persist the per-asset feature cache.
+
+    Snapshots under the lock first: the job thread inserts entries while we
+    dump, and json.dump over a growing dict raises 'dictionary changed size'.
+    """
+    with _feature_lock:
+        payload = {"version": FEATURE_CACHE_VERSION,
+                   "assets": {k: dict(v) for k, v in _feature_cache.items()}}
     tmp = FEATURE_CACHE_PATH + ".tmp"
     with open(tmp, "w") as f:
-        json.dump({"version": FEATURE_CACHE_VERSION, "assets": _feature_cache}, f)
+        json.dump(payload, f)
     os.replace(tmp, FEATURE_CACHE_PATH)
 
 
 load_checkpoint()
 load_feature_cache()
+load_params()
 
 
 def _pil_to_data_url(img: Image.Image) -> str:
@@ -405,14 +624,16 @@ SMILE_HEIGHT_RATIO_AT_ONE = 0.04
 NOSE_TIP_LANDMARK_INDEX = 1
 
 
-def _analyze_face_landmarks(lms):
+def _analyze_face_landmarks(lms, expr_weights=None):
     """
     Given MediaPipe face landmarks, compute:
       - eyes_open in [0, 1] (continuous) from eye aspect ratio
       - smile in [0, 1] (continuous) from mouth width/height relative to face width
       - facing in [0, 1] (continuous) from vertical symmetry: nose tip vs face center
-      - expression score in [0, 1] (eyes + smile + facing), used for primary and family.
+      - expression score in [0, 1] (weighted eyes + smile + facing). Weights come
+        from the params snapshot (expr_w_*) so debug views agree with scoring.
     """
+    w_eyes, w_smile, w_facing = expr_weights or (0.5, 0.2, 0.3)
     xs = [lm.x for lm in lms]
     face_w = max(xs) - min(xs) if xs else 0.0
     if face_w <= 0:
@@ -440,8 +661,8 @@ def _analyze_face_landmarks(lms):
     nose_x = lms[NOSE_TIP_LANDMARK_INDEX].x
     facing = max(0.0, 1.0 - 2.0 * abs(nose_x - center_x) / (face_w + 1e-6))
 
-    # Expression: eyes + smile + facing (primary and family both use this).
-    expr_score = 0.5 * eyes_open + 0.2 * smile + 0.3 * facing
+    # Expression: weighted eyes + smile + facing (primary and family both use this).
+    expr_score = w_eyes * eyes_open + w_smile * smile + w_facing * facing
     return eyes_open, smile, facing, expr_score
 
 
@@ -458,7 +679,8 @@ def _fetch_faces_for_asset(asset_id: str) -> list[dict]:
     url = f"{IMMICH_URL}/api/faces"
     resp = requests.get(url, headers=HEADERS, params={"id": asset_id}, timeout=10)
     if resp.status_code != 200:
-        _faces_cache[asset_id] = []
+        # Do NOT cache failures: a transient Immich error must not become a
+        # permanent "no faces" for this asset.
         return []
     data = resp.json()
     if not isinstance(data, list):
@@ -477,7 +699,7 @@ def _fetch_faces_for_asset(asset_id: str) -> list[dict]:
             pid = person.get("id") or person.get("personId") or person.get("person_id")
             if pid:
                 person_ids.append(pid)
-                if pid in FAMILY_FACES:
+                if pid in _params["family_faces"]:
                     family_hits.append(pid)
     if face_ids or person_ids:
         print(
@@ -488,11 +710,23 @@ def _fetch_faces_for_asset(asset_id: str) -> list[dict]:
     return data
 
 
-def _extract_face_bboxes_from_asset(asset):
+def _face_type(pid, params=None):
+    """Classify an Immich person id: 'primary' > 'family' > 'other' (None -> other)."""
+    p = params or _params
+    if pid is not None:
+        if pid in p["face_ids"]:
+            return "primary"
+        if pid in p["family_faces"]:
+            return "family"
+    return "other"
+
+
+def _extract_face_boxes_with_pid(asset):
     """
     Extract face bounding boxes for an Immich asset using /api/faces.
-    Returns list of (x1, y1, x2, y2, imageWidth, imageHeight, face_type),
-    where face_type is one of: \"primary\", \"family\", \"other\".
+    Returns list of (x1, y1, x2, y2, imageWidth, imageHeight, pid_or_None).
+    The owning person id is kept (not pre-classified) so faces can be
+    re-classified under whatever face sets are active at scoring time.
     """
     asset_id = asset.get("id")
     faces = _fetch_faces_for_asset(asset_id)
@@ -514,14 +748,9 @@ def _extract_face_bboxes_from_asset(asset):
         pid = None
         if isinstance(person, dict):
             pid = person.get("id") or person.get("personId") or person.get("person_id")
-        # Classify face type: primary (search keys) > family (const) > other.
-        face_type = "other"
-        if pid is not None:
-            if pid in FACE_IDS:
-                face_type = "primary"
-            elif pid in FAMILY_FACES:
-                face_type = "family"
-        boxes.append((float(x1), float(y1), float(x2), float(y2), float(iw), float(ih), face_type))
+        if pid:
+            pid = str(pid).lower()
+        boxes.append((float(x1), float(y1), float(x2), float(y2), float(iw), float(ih), pid))
     return boxes
 
 
@@ -560,12 +789,17 @@ def _face_box_to_expanded_crop(x1, y1, x2, y2, iw, ih, img_width, img_height, ex
     return (ex1, ey1, ex2, ey2)
 
 
-def _expression_from_mediapipe(img, asset):
+def _detect_face_rows(img, asset):
     """
-    Compute an expression score for an image using MediaPipe Tasks FaceLandmarker.
+    Detect faces and measure raw per-face signals (MediaPipe only, no scoring).
+
     If Immich provides face bounding boxes, run the landmarker on each face crop
-    (using those boxes) and aggregate; otherwise, fall back to running on the full image.
-    Returns (expression_score, summary_dict).
+    and keep the owning person id with every row; otherwise run once on the full
+    image with pid=None (those faces can never be classified primary/family).
+
+    Returns {"mode": "boxes"|"full", "rows": [[pid_or_None, eyes, smile, facing], ...]}.
+    The rows are cacheable, so aggregate_expression() can re-score under any
+    params or face sets without re-running MediaPipe.
     """
     landmarker = _get_face_landmarker()
 
@@ -573,162 +807,154 @@ def _expression_from_mediapipe(img, asset):
     # Use same dimension convention as debug: (width, height) from PIL so crop math matches.
     img_width, img_height = img.size
 
-    # Face boxes from Immich, annotated with face_type (\"primary\" | \"family\" | \"other\").
-    boxes = _extract_face_bboxes_from_asset(asset)
-    primary_exprs: list[float] = []
-    primary_eyes: list[float] = []
-    primary_smiles: list[float] = []
-    primary_facing: list[float] = []
-    family_exprs: list[float] = []
-    family_eyes: list[float] = []
-    family_smiles: list[float] = []
-    family_facing: list[float] = []
-    other_exprs: list[float] = []
-    other_eyes: list[float] = []
-    other_smiles: list[float] = []
-    face_debug_info: list[str] = []
+    # Face boxes from Immich, each with its owning Immich person id.
+    boxes = _extract_face_boxes_with_pid(asset)
+    rows: list[list] = []
 
-    # Helper to run landmarker on a given RGB crop and accumulate stats.
-    def process_crop(crop_rgb: np.ndarray, face_type: str, bbox_desc: str):
-        nonlocal primary_exprs, primary_eyes, primary_smiles, primary_facing
-        nonlocal family_exprs, family_eyes, family_smiles, family_facing
-        nonlocal other_exprs, other_eyes, other_smiles, face_debug_info
+    # Helper to run the landmarker on one RGB crop and append rows.
+    def detect_crop(crop_rgb: np.ndarray, pid, bbox_desc: str):
         if crop_rgb.size == 0:
             return
         mp_face = mp.Image(image_format=mp.ImageFormat.SRGB, data=crop_rgb)
         result = landmarker.detect(mp_face)
         lms_list = result.face_landmarks or []
         print(f"  -> {bbox_desc} {len(lms_list)} faces detected")
-        if not lms_list:
-            return
         for li, lms in enumerate(lms_list):
-            eyes_open, smile, facing, expr = _analyze_face_landmarks(lms)
-            info = (
-                f"{bbox_desc} face#{li}: type={face_type} "
-                f"eyes={eyes_open:.2f} smile={smile:.2f} facing={facing:.2f} expr={expr:.3f}"
+            eyes_open, smile, facing, _expr = _analyze_face_landmarks(lms)
+            print(
+                f"  {bbox_desc} face#{li}: pid={pid} "
+                f"eyes={eyes_open:.2f} smile={smile:.2f} facing={facing:.2f}"
             )
-            face_debug_info.append(info)
-            if face_type == "primary":
-                primary_exprs.append(expr)
-                primary_eyes.append(eyes_open)
-                primary_smiles.append(smile)
-                primary_facing.append(facing)
-            elif face_type == "family":
-                family_exprs.append(expr)
-                family_eyes.append(eyes_open)
-                family_smiles.append(smile)
-                family_facing.append(facing)
-            else:
-                other_exprs.append(expr)
-                other_eyes.append(eyes_open)
-                other_smiles.append(smile)
+            rows.append([pid, eyes_open, smile, facing])
 
     if boxes:
         # Use Immich's face boxes to crop and run the landmarker per face (same crop logic as debug).
-        for bi, (x1, y1, x2, y2, iw, ih, face_type) in enumerate(boxes):
+        for bi, (x1, y1, x2, y2, iw, ih, pid) in enumerate(boxes):
             rect = _face_box_to_expanded_crop(x1, y1, x2, y2, iw, ih, img_width, img_height)
             if rect is None:
                 continue
             ex1, ey1, ex2, ey2 = rect
             # Contiguous copy so MediaPipe gets a valid buffer (slicing can yield non-contiguous view).
             crop = np.ascontiguousarray(img_rgb[ey1:ey2, ex1:ex2, :])
-            bbox_desc = f"[box{bi} type={face_type}]"
-            process_crop(crop, face_type, bbox_desc)
-    else:
-        # Fallback: run on the full image once, treat all faces as "other".
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(img_rgb))
-        result = landmarker.detect(mp_image)
-        faces = result.face_landmarks or []
-        if not faces:
-            print(f"  -> No faces detected in {asset.get('id')}")
-            return 0.0, {}
-        for li, lms in enumerate(faces):
-            eyes_open, smile, facing, expr = _analyze_face_landmarks(lms)
-            info = (
-                f"[full] face#{li}: fam=False "
-                f"eyes={eyes_open:.2f} smile={smile:.2f} facing={facing:.2f} expr={expr:.3f}"
-            )
-            face_debug_info.append(info)
-            other_exprs.append(expr)
-            other_eyes.append(eyes_open)
-            other_smiles.append(smile)
+            detect_crop(crop, pid, f"[box{bi} type={_face_type(pid)}]")
+        return {"mode": "boxes", "rows": rows}
+
+    # Fallback: run on the full image once; faces have no person id ("other").
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(img_rgb))
+    result = landmarker.detect(mp_image)
+    faces = result.face_landmarks or []
+    if not faces:
+        print(f"  -> No faces detected in {asset.get('id')}")
+        return {"mode": "full", "rows": []}
+    for li, lms in enumerate(faces):
+        eyes_open, smile, facing, _expr = _analyze_face_landmarks(lms)
+        print(f"  [full] face#{li}: pid=None eyes={eyes_open:.2f} smile={smile:.2f} facing={facing:.2f}")
+        rows.append([None, eyes_open, smile, facing])
+    return {"mode": "full", "rows": rows}
+
+def aggregate_expression(face_payload, params):
+    """
+    Pure re-aggregation of expression score + family boost from cached face rows
+    (see _detect_face_rows): rows are [pid_or_None, eyes, smile, facing]. The pid
+    decides each face's role under `params`, so changing face sets, expression
+    sub-weights or family-boost params re-scores without re-running MediaPipe.
+
+    Returns (expression_score, family_boost, summary_dict) with the historical
+    summary keys. No rows -> (0.0, 0.0, {}).
+    """
+    rows = (face_payload or {}).get("rows") or []
+    face_ids = params["face_ids"]
+    family_ids = params["family_faces"]
+    primary = [r for r in rows if r[0] in face_ids]
+    family = [r for r in rows if r[0] not in face_ids and r[0] in family_ids]
+    other_count = len(rows) - len(primary) - len(family)
+
+    w_eyes = params["expr_w_eyes"]
+    w_smile = params["expr_w_smile"]
+    w_facing = params["expr_w_facing"]
+
+    def face_expr(r):
+        return w_eyes * r[1] + w_smile * r[2] + w_facing * r[3]
 
     # Aggregate expression:
-    # - Primary faces (FACE_IDS) drive the main expression score if present.
+    # - Primary faces drive the main expression score if present.
     # - Otherwise, family faces drive expression.
-    # - Other faces are ignored for expression (expr=0 if only others).
-    if primary_exprs:
-        expr = float(np.mean(primary_exprs))
-    elif family_exprs:
-        expr = float(np.mean(family_exprs))
-    elif other_exprs:
-        # Only non-family, non-primary faces -> treat as no reliable expression signal.
+    # - Only non-primary, non-family faces -> no reliable expression signal (0.0).
+    if primary:
+        expr = float(np.mean([face_expr(r) for r in primary]))
+    elif family:
+        expr = float(np.mean([face_expr(r) for r in family]))
+    elif other_count:
         expr = 0.0
     else:
-        return 0.0, {}
+        return 0.0, 0.0, {}
 
-    # Family boost: continuous eyes, smile, facing per face; facing has more weight.
-    # Only count face if facing >= FAMILY_FACING_MIN; discount each face's contribution by 0.5.
-    if family_exprs:
-        fam_eyes = float(np.mean(family_eyes)) if family_eyes else 0.0
-        fam_smile = float(np.mean(family_smiles)) if family_smiles else 0.0
-        fam_count = len(family_exprs)
-        family_boost = 0.0
-        for e, s, f in zip(family_eyes, family_smiles, family_facing):
-            if f < FAMILY_FACING_MIN:
-                continue
-            raw = (
-                FAMILY_BOOST_WEIGHT_EYES * e
-                + FAMILY_BOOST_WEIGHT_SMILE * s
-                + FAMILY_BOOST_WEIGHT_FACING * f
-            )
-            family_boost += FAMILY_BOOST_DISCOUNT * raw
-        family_contributing_count = sum(
-            1 for f in family_facing if f >= FAMILY_FACING_MIN
-        )
-    else:
-        fam_eyes = 0.0
-        fam_smile = 0.0
-        fam_count = 0
-        family_boost = 0.0
-        family_contributing_count = 0
-
-    other_count = len(other_exprs)
-    primary_count = len(primary_exprs)
+    # Family boost: continuous eyes, smile, facing per face; facing weighted higher.
+    # Only faces with facing >= family_facing_min contribute, discounted per face.
+    fw_eyes = params["family_boost_weight_eyes"]
+    fw_smile = params["family_boost_weight_smile"]
+    fw_facing = params["family_boost_weight_facing"]
+    facing_min = params["family_facing_min"]
+    discount = params["family_boost_discount"]
+    family_boost = 0.0
+    family_contributing_count = 0
+    for r in family:
+        if r[3] < facing_min:
+            continue
+        raw = fw_eyes * r[1] + fw_smile * r[2] + fw_facing * r[3]
+        family_boost += discount * raw
+        family_contributing_count += 1
 
     # Summary fractions: show the stats for whoever drove expr (primary or family).
-    if primary_exprs:
-        eyes_open_frac = float(np.mean(primary_eyes)) if primary_eyes else 0.0
-        smile_frac = float(np.mean(primary_smiles)) if primary_smiles else 0.0
-        facing_frac = float(np.mean(primary_facing)) if primary_facing else 0.0
-    elif family_exprs:
-        eyes_open_frac = fam_eyes
-        smile_frac = fam_smile
-        facing_frac = float(np.mean(family_facing)) if family_facing else 0.0
-    else:
-        eyes_open_frac = 0.0
-        smile_frac = 0.0
-        facing_frac = 0.0
+    driver = primary or family
+    eyes_open_frac = float(np.mean([r[1] for r in driver])) if driver else 0.0
+    smile_frac = float(np.mean([r[2] for r in driver])) if driver else 0.0
+    facing_frac = float(np.mean([r[3] for r in driver])) if driver else 0.0
 
     summary = {
         "eyes_open_fraction": eyes_open_frac * 100.0,
         "smile_fraction": smile_frac * 100.0,
         "facing_fraction": facing_frac * 100.0,
-        "primary_faces": primary_count,
-        "family_faces": fam_count,
+        "primary_faces": len(primary),
+        "family_faces": len(family),
         "family_boost": family_boost,
         "family_contributing_count": family_contributing_count,
         "other_faces": other_count,
     }
-    if face_debug_info:
-        print(
-            f"    [faces_detail] asset={asset.get('id')} "
-            f"details=" + " | ".join(face_debug_info)
-        )
     print(
-        f"    [expr_fam] total_faces={fam_count + other_count} fam={fam_count} other={other_count} "
-        f"expr={expr:.3f} smile={smile_frac:.2f} eyes={eyes_open_frac:.2f}"
+        f"    [expr_fam] total_faces={len(rows)} primary={len(primary)} fam={len(family)} "
+        f"other={other_count} expr={expr:.3f} smile={smile_frac:.2f} eyes={eyes_open_frac:.2f}"
     )
+    return expr, family_boost, summary
+
+
+def _expression_from_mediapipe(img, asset, params=None):
+    """Detect faces, then aggregate under `params` (default: live settings).
+    Kept for callers that want (expression_score, summary_dict) directly."""
+    payload = _detect_face_rows(img, asset)
+    expr, _boost, summary = aggregate_expression(payload, params or _params)
+    return expr, summary
+
+
+def _backfill_faces(asset, entry):
+    """Backfill a v1 cache entry with per-face rows (MediaPipe only — no MUSIQ/CLIP).
+
+    Stores the payload on the cache entry and returns it; None when no thumbnail
+    is available (the caller scores the asset with a neutral expression).
+    """
+    img = download_thumbnail(asset.get("id"))
+    if img is None:
+        return None
+    payload = _detect_face_rows(img, asset)
+    with _feature_lock:
+        entry["faces"] = payload
+    return payload
+
+
+def _expression_summary(face_payload, asset_id, params):
+    """Aggregate expression + family boost from face rows under `params`."""
+    expr, _boost, summary = aggregate_expression(face_payload, params)
+    print(f"    [expr] asset={asset_id} expr={expr:.3f} summary={summary}")
     return expr, summary
 
 
@@ -744,12 +970,13 @@ def debug_crops(asset_id):
 
     w, h = img.size
     landmarker = _get_face_landmarker()
-    boxes = _extract_face_bboxes_from_asset({"id": asset_id})
+    boxes = _extract_face_boxes_with_pid({"id": asset_id})
     if not boxes:
         return f"<h3>No Immich faces for asset {asset_id}</h3>", 200
 
+    expr_weights = (_params["expr_w_eyes"], _params["expr_w_smile"], _params["expr_w_facing"])
     rows = []
-    for idx, (x1, y1, x2, y2, iw, ih, face_type) in enumerate(boxes):
+    for idx, (x1, y1, x2, y2, iw, ih, pid) in enumerate(boxes):
         rect = _face_box_to_expanded_crop(x1, y1, x2, y2, iw, ih, w, h)
         if rect is None:
             continue
@@ -764,7 +991,7 @@ def debug_crops(asset_id):
         face_count = len(faces)
         face_details: list[str] = []
         for li, lms in enumerate(faces):
-            eyes_open, smile, facing, expr = _analyze_face_landmarks(lms)
+            eyes_open, smile, facing, expr = _analyze_face_landmarks(lms, expr_weights)
             face_details.append(
                 f"face#{li}: eyes={eyes_open:.2f} smile={smile:.2f} facing={facing:.2f} expr={expr:.3f}"
             )
@@ -776,7 +1003,7 @@ def debug_crops(asset_id):
         data_url = _pil_to_data_url(crop)
         rows.append(
             f"<div style='display:inline-block; margin:10px; text-align:center;'>"
-            f"<div>#{idx} type={face_type} "
+            f"<div>#{idx} type={_face_type(pid)} "
             f"orig=({x1:.1f},{y1:.1f},{x2:.1f},{y2:.1f}) "
             f"crop=({ex1},{ey1},{ex2},{ey2}) "
             f"detect_faces={face_count} [{detect_summary}]</div>"
@@ -799,10 +1026,167 @@ def debug_crops(asset_id):
     )
     return html
 
-def evaluate_and_cluster(assets, device, clip_model, clip_processor):
+def combine_and_cluster(assets, quality_scores, expression_scores, clip_feats, params):
     """
-    Evaluates assets with PyIQA (quality) and MediaPipe (expression), clusters for variety.
-    Returns the top scoring assets per cluster.
+    Pure scoring core shared by the run path and re-scores: normalize quality and
+    expression, add person/family boosts, cluster in CLIP space, boost cluster
+    tops and sort. Mutates and returns `assets` sorted for the cluster view.
+    """
+    if not assets:
+        return []
+
+    # 3. Normalize and combine using global params (so scales are comparable across days)
+    def _norm_global(scores, mean, std):
+        s = np.array(scores, dtype=np.float64)
+        if std <= 0:
+            return np.zeros_like(s)
+        return (s - mean) / std
+    q_norm = _norm_global(quality_scores, params["quality_mean"], params["quality_std"])
+    e_norm = _norm_global(expression_scores, params["expression_mean"], params["expression_std"])
+    for i in range(len(assets)):
+        asset = assets[i]
+        person_hits = asset.get("_person_match_count", 1)
+        person_boost = params["person_weight"] * (person_hits - 1)
+
+        # Family boost: continuous eyes/smile/facing (precomputed in expression summary).
+        summary = asset.get("_expression_emotions") or {}
+        smile_boost = float(summary.get("family_boost", 0.0))
+        total = float(
+            params["quality_weight"] * q_norm[i]
+            + params["expression_weight"] * e_norm[i]
+            + person_boost
+            + smile_boost
+        )
+        asset["_smile_boost"] = smile_boost
+        if smile_boost > 0:
+            print(
+                f"    [smile_boost] asset={asset.get('id')} "
+                f"family_contributing={summary.get('family_contributing_count', 0)} boost={smile_boost:.3f}"
+            )
+        asset["_total_score"] = total
+        asset["_base_score"] = total
+
+    # 4. Threshold-based clustering in CLIP space:
+    #    - Iterate assets in descending total score order.
+    #    - For each, assign to the first cluster whose centroid has cosine
+    #      similarity >= clip_cluster_sim_threshold; otherwise start a new cluster.
+    X = np.stack(clip_feats, axis=0).astype(np.float32)
+    order = sorted(range(len(assets)), key=lambda i: -assets[i]["_total_score"])
+    centroids: list[np.ndarray] = []
+    cluster_ids = [-1] * len(assets)
+
+    for idx in order:
+        x = X[idx]
+        if not centroids:
+            centroids.append(x.copy())
+            cluster_ids[idx] = 0
+            continue
+        sims = [float(np.dot(x, c)) for c in centroids]
+        best_id = int(np.argmax(sims))
+        if sims[best_id] >= params["clip_cluster_sim_threshold"]:
+            cluster_ids[idx] = best_id
+            # Update centroid with simple running average
+            centroids[best_id] = (centroids[best_id] + x) / 2.0
+        else:
+            new_id = len(centroids)
+            centroids.append(x.copy())
+            cluster_ids[idx] = new_id
+
+    n_clusters = len(centroids)
+
+    # Optionally recluster with KMeans if too many clusters; cap at max_clusters_per_day.
+    if n_clusters > params["max_clusters_per_day"]:
+        from sklearn.cluster import KMeans
+
+        k = min(params["max_clusters_per_day"], len(assets))
+        print(f"  -> Reclustering {len(assets)} assets into {k} clusters via KMeans (was {n_clusters}).")
+        kmeans = KMeans(n_clusters=k, random_state=0, n_init=10)
+        labels = kmeans.fit_predict(X)
+        cluster_ids = [int(l) for l in labels]
+        n_clusters = k
+
+    # 5. Cluster-top boost: for each cluster, give the top-1 asset an extra bonus
+    #    that grows with cluster size but saturates.
+    clusters: dict[int, list[int]] = {}
+    for i, cid in enumerate(cluster_ids):
+        clusters.setdefault(cid, []).append(i)
+
+    top_weight = params["cluster_top_weight"]
+    top_max_size = params["cluster_top_max_size"]
+
+    def _cluster_top_boost(size: int) -> float:
+        capped = min(max(size, 1), top_max_size)
+        # Map size 1..cluster_top_max_size -> (0..1] then scale by cluster_top_weight.
+        return top_weight * (np.log1p(capped) / np.log1p(top_max_size))
+
+    # Initialize final scores and cluster sizes
+    for cid, idxs in clusters.items():
+        size = len(idxs)
+        for idx in idxs:
+            assets[idx]["_cluster_id"] = cid
+            assets[idx]["_cluster_size"] = size
+            assets[idx]["_final_score"] = assets[idx]["_total_score"]
+
+        # Boost the top-1 asset in this cluster
+        if idxs:
+            top_idx = max(idxs, key=lambda i: assets[i]["_total_score"])
+            boost = _cluster_top_boost(size)
+            assets[top_idx]["_final_score"] = assets[top_idx]["_total_score"] + boost
+            assets[top_idx]["_cluster_top_boost"] = boost
+
+    # Sort by cluster top score descending for cluster view / ordering.
+    cluster_top_score: dict[int, float] = {}
+    for cid, idxs in clusters.items():
+        if not idxs:
+            continue
+        top_idx = max(idxs, key=lambda i: assets[i]["_final_score"])
+        cluster_top_score[cid] = assets[top_idx]["_final_score"]
+
+    # Sort by (cluster_top_score desc, then per-asset final score desc)
+    assets.sort(
+        key=lambda a: (
+            -cluster_top_score.get(a.get("_cluster_id", -1), float("-inf")),
+            -a.get("_final_score", a.get("_total_score", 0.0)),
+        )
+    )
+    scores = [a.get("_final_score", a["_total_score"]) for a in assets]
+    print(f"  -> Score range (final): min={min(scores):.3f} max={max(scores):.3f} mean={sum(scores)/len(scores):.3f}")
+    print(f"  -> Total assets this day: {len(assets)} (clusters={n_clusters}).")
+    return assets
+
+
+def _compute_asset_features(asset, device, clip_model, clip_processor, params):
+    """ML feature path for one asset: MUSIQ quality + face rows + CLIP embedding.
+    Returns (raw_q, face_payload, feats), or None when no thumbnail is available."""
+    asset_id = asset.get("id")
+    img = download_thumbnail(asset_id)
+    if img is None:
+        return None
+
+    # 1. Image quality scores via MUSIQ (PyIQA). Higher = better quality.
+    img_t = _pil_to_tensor_01(img)  # (1,3,H,W), CPU tensor
+    q_tensor = _musiq_metric(img_t)
+    raw_q = float(q_tensor.item())
+    if not np.isfinite(raw_q):
+        raw_q = params["quality_mean"]
+
+    # 2. Expression via MediaPipe Face Landmarker (rows kept for re-scoring).
+    face_payload = _detect_face_rows(img, asset)
+
+    # 3. CLIP embedding for clustering.
+    with torch.no_grad():
+        clip_inputs = clip_processor(images=img, return_tensors="pt").to(device)
+        feats = clip_model.get_image_features(**clip_inputs)
+        feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+    feats = feats.squeeze(0).cpu().numpy().astype(np.float32)
+    return raw_q, face_payload, feats
+
+
+def evaluate_and_cluster(assets, device, clip_model, clip_processor, params):
+    """
+    Evaluates assets with PyIQA (quality) and MediaPipe (expression), then hands
+    the features to combine_and_cluster for scoring. `params` is the job's
+    settings snapshot. Returns the scored, clustered, sorted assets.
     """
     if not assets:
         return []
@@ -826,39 +1210,31 @@ def evaluate_and_cluster(assets, device, clip_model, clip_processor):
         with _feature_lock:
             cached = _feature_cache.get(asset_id)
         if cached is not None:
-            # Cache hit: reuse the stored quality/expression/CLIP features.
+            # Cache hit: reuse the stored quality/CLIP features and re-aggregate
+            # the expression under the current params (v1 entries get backfilled).
             raw_q = cached["q"]
-            expr = cached["e"]
-            summary = cached.get("sum") or {}
             feats = np.frombuffer(base64.b64decode(cached["clip"]), dtype=np.float32)
+            face_rows = cached.get("faces")
+            if face_rows is None:
+                print(f"    [backfill] asset={asset_id} missing face rows; running MediaPipe.")
+                face_rows = _backfill_faces(asset, cached)
+            expr, summary = _expression_summary(face_rows, asset_id, params)
+            with _feature_lock:
+                cached["e"] = expr
+                cached["sum"] = summary or {}
             print(f"    [cache] asset={asset_id} expr={float(expr):.3f} (reused)")
         else:
-            img = download_thumbnail(asset_id)
-            if img is None:
+            computed = _compute_asset_features(asset, device, clip_model, clip_processor, params)
+            if computed is None:
                 continue
-
-            # 1. Image quality scores via MUSIQ (PyIQA). Higher = better quality.
-            img_t = _pil_to_tensor_01(img)  # (1,3,H,W), CPU tensor
-            q_tensor = _musiq_metric(img_t)
-            raw_q = float(q_tensor.item())
-            if not np.isfinite(raw_q):
-                raw_q = QUALITY_MEAN
-
-            # 2. Expression via MediaPipe Face Landmarker.
-            expr, summary = _expression_from_mediapipe(img, asset)
-            print(f"    [expr] asset={asset_id} expr={expr:.3f} summary={summary}")
-
-            # 3. CLIP embedding for clustering.
-            with torch.no_grad():
-                clip_inputs = clip_processor(images=img, return_tensors="pt").to(device)
-                feats = clip_model.get_image_features(**clip_inputs)
-                feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
-            feats = feats.squeeze(0).cpu().numpy().astype(np.float32)
+            raw_q, face_payload, feats = computed
+            expr, summary = _expression_summary(face_payload, asset_id, params)
             with _feature_lock:
                 _feature_cache[asset_id] = {
                     "q": raw_q,
                     "e": expr,
                     "sum": summary or {},
+                    "faces": face_payload,
                     "clip": base64.b64encode(feats.tobytes()).decode("ascii"),
                 }
 
@@ -883,123 +1259,7 @@ def evaluate_and_cluster(assets, device, clip_model, clip_processor):
         exp_mean = sum(expression_scores) / len(expression_scores)
         print(f"  -> Expression scores: min={exp_min:.3f} max={exp_max:.3f} mean={exp_mean:.3f}")
 
-    # 3. Normalize and combine using global params (so scales are comparable across days)
-    def _norm_global(scores, mean, std):
-        s = np.array(scores, dtype=np.float64)
-        if std <= 0:
-            return np.zeros_like(s)
-        return (s - mean) / std
-    q_norm = _norm_global(quality_scores, QUALITY_MEAN, QUALITY_STD)
-    e_norm = _norm_global(expression_scores, EXPRESSION_MEAN, EXPRESSION_STD)
-    for i in range(len(valid_assets)):
-        asset = valid_assets[i]
-        person_hits = asset.get("_person_match_count", 1)
-        person_boost = PERSON_WEIGHT * (person_hits - 1)
-
-        # Family boost: continuous eyes/smile/facing (precomputed in expression summary).
-        summary = asset.get("_expression_emotions") or {}
-        smile_boost = float(summary.get("family_boost", 0.0))
-        total = float(
-            QUALITY_WEIGHT * q_norm[i]
-            + EXPRESSION_WEIGHT * e_norm[i]
-            + person_boost
-            + smile_boost
-        )
-        asset["_smile_boost"] = smile_boost
-        if smile_boost > 0:
-            print(
-                f"    [smile_boost] asset={asset.get('id')} "
-                f"family_contributing={summary.get('family_contributing_count', 0)} boost={smile_boost:.3f}"
-            )
-        asset["_total_score"] = total
-        asset["_base_score"] = total
-
-    # 4. Cluster for variety using CLIP image embeddings (semantic diversity)
-    X = np.stack(clip_feats, axis=0).astype(np.float32)
-
-    # 4. Threshold-based clustering in CLIP space:
-    #    - Iterate assets in descending total score order.
-    #    - For each, assign to the first cluster whose centroid has cosine
-    #      similarity >= CLIP_CLUSTER_SIM_THRESHOLD; otherwise start a new cluster.
-    order = sorted(range(len(valid_assets)), key=lambda i: -valid_assets[i]["_total_score"])
-    centroids: list[np.ndarray] = []
-    cluster_ids = [-1] * len(valid_assets)
-
-    for idx in order:
-        x = X[idx]
-        if not centroids:
-            centroids.append(x.copy())
-            cluster_ids[idx] = 0
-            continue
-        sims = [float(np.dot(x, c)) for c in centroids]
-        best_id = int(np.argmax(sims))
-        if sims[best_id] >= CLIP_CLUSTER_SIM_THRESHOLD:
-            cluster_ids[idx] = best_id
-            # Update centroid with simple running average
-            centroids[best_id] = (centroids[best_id] + x) / 2.0
-        else:
-            new_id = len(centroids)
-            centroids.append(x.copy())
-            cluster_ids[idx] = new_id
-
-    n_clusters = len(centroids)
-
-    # Optionally recluster with KMeans if too many clusters; cap at 20 per day.
-    if n_clusters > 20:
-        from sklearn.cluster import KMeans
-
-        k = min(20, len(valid_assets))
-        print(f"  -> Reclustering {len(valid_assets)} assets into {k} clusters via KMeans (was {n_clusters}).")
-        kmeans = KMeans(n_clusters=k, random_state=0, n_init=10)
-        labels = kmeans.fit_predict(X)
-        cluster_ids = [int(l) for l in labels]
-        n_clusters = k
-
-    # 5. Cluster-top boost: for each cluster, give the top-1 asset an extra bonus
-    #    that grows with cluster size but saturates.
-    clusters: dict[int, list[int]] = {}
-    for i, cid in enumerate(cluster_ids):
-        clusters.setdefault(cid, []).append(i)
-
-    def _cluster_top_boost(size: int) -> float:
-        capped = min(max(size, 1), CLUSTER_TOP_MAX_SIZE)
-        # Map size 1..CLUSTER_TOP_MAX_SIZE -> (0..1] then scale by CLUSTER_TOP_WEIGHT.
-        return CLUSTER_TOP_WEIGHT * (np.log1p(capped) / np.log1p(CLUSTER_TOP_MAX_SIZE))
-
-    # Initialize final scores and cluster sizes
-    for cid, idxs in clusters.items():
-        size = len(idxs)
-        for idx in idxs:
-            valid_assets[idx]["_cluster_id"] = cid
-            valid_assets[idx]["_cluster_size"] = size
-            valid_assets[idx]["_final_score"] = valid_assets[idx]["_total_score"]
-
-        # Boost the top-1 asset in this cluster
-        if idxs:
-            top_idx = max(idxs, key=lambda i: valid_assets[i]["_total_score"])
-            boost = _cluster_top_boost(size)
-            valid_assets[top_idx]["_final_score"] = valid_assets[top_idx]["_total_score"] + boost
-            valid_assets[top_idx]["_cluster_top_boost"] = boost
-
-    # Sort by cluster top score descending for cluster view / ordering.
-    cluster_top_score: dict[int, float] = {}
-    for cid, idxs in clusters.items():
-        if not idxs:
-            continue
-        top_idx = max(idxs, key=lambda i: valid_assets[i]["_final_score"])
-        cluster_top_score[cid] = valid_assets[top_idx]["_final_score"]
-
-    # Sort by (cluster_top_score desc, then per-asset final score desc)
-    valid_assets.sort(
-        key=lambda a: (
-            -cluster_top_score.get(a.get("_cluster_id", -1), float("-inf")),
-            -a.get("_final_score", a.get("_total_score", 0.0)),
-        )
-    )
-    scores = [a.get("_final_score", a["_total_score"]) for a in valid_assets]
-    print(f"  -> Score range (final): min={min(scores):.3f} max={max(scores):.3f} mean={sum(scores)/len(scores):.3f}")
-    print(f"  -> Total assets this day: {len(valid_assets)} (clusters={n_clusters}).")
-    return valid_assets
+    return combine_and_cluster(valid_assets, quality_scores, expression_scores, clip_feats, params)
 
 # ==========================================
 # 3. MAIN WORKFLOW
@@ -1020,15 +1280,16 @@ def load_models():
     return _models_cache
 
 
-def recompute_default_selection():
+def recompute_default_selection(params=None):
     """
     Recompute default selected_asset_ids from curated_assets_by_date
     using the rule:
       - select the top photo in each cluster whose final score
-        >= DEFAULT_MIN_FINAL_SCORE
+        >= default_min_final_score
       - AND always select the top photo from at least the top
-        DEFAULT_MIN_TOP_CLUSTERS clusters (by best score) for that day.
+        default_min_top_clusters clusters (by best score) for that day.
     """
+    p = params or _params
     global selected_asset_ids
     selected = set()
     for _date, assets in curated_assets_by_date.items():
@@ -1050,28 +1311,31 @@ def recompute_default_selection():
             cluster_items.append((cid, score, a))
         cluster_items.sort(key=lambda x: -x[1])
         top_cluster_ids = {
-            cid for cid, _score, _a in cluster_items[:DEFAULT_MIN_TOP_CLUSTERS]
+            cid for cid, _score, _a in cluster_items[: p["default_min_top_clusters"]]
         }
         for cid, score, a in cluster_items:
-            if score >= DEFAULT_MIN_FINAL_SCORE or cid in top_cluster_ids:
+            if score >= p["default_min_final_score"] or cid in top_cluster_ids:
                 if "id" in a:
                     selected.add(a["id"])
     selected_asset_ids = selected
 
 
-def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_album=False):
+def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_album=False, params=None):
     """
     Run search + scoring + clustering for each day in [start_date, end_date]
     and populate curated_assets_by_date. Call this from /process when user submits dates.
     Updates CURATION_STATE for the /progress endpoint and checkpoints to disk per day.
+    Scores against a snapshot of the settings taken when the job starts.
     """
-    global curated_assets_by_date, selected_asset_ids
+    global curated_assets_by_date, selected_asset_ids, _last_scored_params
+    params = params or snapshot_params()
+    _last_scored_params = copy.deepcopy(params)
     days_total = (end_date - start_date).days + 1
     CURATION_CANCEL.clear()
     with CURATION_LOCK:
         CURATION_STATE.update(
-            state="running", days_total=days_total, days_done=0, current_date="",
-            assets_done=0, assets_total=0, started_at=time.time(),
+            state="running", phase="curation", days_total=days_total, days_done=0,
+            current_date="", assets_done=0, assets_total=0, started_at=time.time(),
             finished_at=None, error="",
             start_date=start_date.strftime("%Y-%m-%d"),
             end_date=end_date.strftime("%Y-%m-%d"),
@@ -1092,11 +1356,11 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
                 CURATION_STATE["current_date"] = current.strftime("%Y-%m-%d")
                 CURATION_STATE["assets_done"] = 0
                 CURATION_STATE["assets_total"] = 0
-            daily_assets = search_assets_for_date(current, FACE_IDS)
+            daily_assets = search_assets_for_date(current, params["face_ids"])
             if daily_assets:
                 with CURATION_LOCK:
                     CURATION_STATE["assets_total"] = len(daily_assets)
-                ranked = evaluate_and_cluster(daily_assets, device, clip_model, clip_processor)
+                ranked = evaluate_and_cluster(daily_assets, device, clip_model, clip_processor, params)
                 if ranked:
                     date_key = current.strftime("%Y-%m-%d")
                     date_asset_ids = {a.get("id") for a in ranked if a.get("id")}
@@ -1110,19 +1374,139 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
                     else:
                         curated_assets_by_date[date_key] = ranked
                         # Per-day checkpoint: a crash loses at most the current day.
-                        save_checkpoint()
+                        save_checkpoint(params=params)
                         save_feature_cache()
             with CURATION_LOCK:
                 CURATION_STATE["days_done"] += 1
                 CURATION_STATE["assets_done"] = CURATION_STATE["assets_total"]
             current += datetime.timedelta(days=1)
-        recompute_default_selection()
-        save_checkpoint()
+        recompute_default_selection(params)
+        save_checkpoint(params=params)
         save_feature_cache()
         if CURATION_CANCEL.is_set():
             print("Curation cancelled by user; days completed so far are kept.")
         else:
             print("Curation complete for selected date range.")
+    except BaseException as e:
+        with CURATION_LOCK:
+            CURATION_STATE["state"] = "error"
+            CURATION_STATE["error"] = f"{type(e).__name__}: {e}"
+            CURATION_STATE["finished_at"] = time.time()
+        raise
+    with CURATION_LOCK:
+        CURATION_STATE["state"] = "cancelled" if CURATION_CANCEL.is_set() else "done"
+        CURATION_STATE["finished_at"] = time.time()
+
+
+def rescore_date(assets, params):
+    """
+    Re-score one day's curated assets in place with `params`: re-aggregate the
+    expression from cached face rows, then run the shared combine+cluster+sort.
+    Only a one-time MediaPipe face backfill (v1 cache entries) touches ML; assets
+    missing from the cache entirely go through the full feature path.
+    Returns (scored, backfilled).
+    """
+    global _musiq_metric
+    scored = backfilled = 0
+    valid: list[dict] = []
+    quality_scores: list[float] = []
+    expression_scores: list[float] = []
+    clip_feats: list[np.ndarray] = []
+    for asset in assets:
+        asset_id = asset.get("id")
+        with _feature_lock:
+            entry = _feature_cache.get(asset_id)
+        if entry is not None:
+            raw_q = entry["q"]
+            feats = np.frombuffer(base64.b64decode(entry["clip"]), dtype=np.float32)
+            face_rows = entry.get("faces")
+            if face_rows is None:
+                backfilled += 1
+                print(f"    [backfill] asset={asset_id} missing face rows; running MediaPipe.")
+                face_rows = _backfill_faces(asset, entry)
+            expr, summary = _expression_summary(face_rows, asset_id, params)
+            with _feature_lock:
+                entry["e"] = expr
+                entry["sum"] = summary or {}
+        else:
+            print(f"    [rescore] asset={asset_id} not in feature cache; computing features.")
+            if _musiq_metric is None:
+                _musiq_metric = pyiqa.create_metric("musiq", device="cpu")
+            device, clip_model, clip_processor = load_models()
+            computed = _compute_asset_features(asset, device, clip_model, clip_processor, params)
+            if computed is None:
+                print(f"    [rescore] asset={asset_id} no thumbnail; keeping old scores.")
+                continue
+            raw_q, face_rows, feats = computed
+            expr, summary = _expression_summary(face_rows, asset_id, params)
+            with _feature_lock:
+                _feature_cache[asset_id] = {
+                    "q": raw_q,
+                    "e": expr,
+                    "sum": summary or {},
+                    "faces": face_rows,
+                    "clip": base64.b64encode(feats.tobytes()).decode("ascii"),
+                }
+        asset["_quality_score"] = raw_q
+        asset["_expression_score"] = expr
+        if summary:
+            asset["_expression_emotions"] = summary
+        else:
+            # Drop stale summaries so combine uses the freshly computed boost.
+            asset.pop("_expression_emotions", None)
+        valid.append(asset)
+        quality_scores.append(raw_q)
+        expression_scores.append(expr)
+        clip_feats.append(feats)
+        scored += 1
+    combine_and_cluster(valid, quality_scores, expression_scores, clip_feats, params)
+    return scored, backfilled
+
+
+def rescore_job(params, dates=None):
+    """
+    Re-score curated days in place with the `params` snapshot, reusing the run
+    state machine for /progress. Never touches selected_asset_ids, so manual
+    curation survives; only score/cluster fields change.
+    """
+    global _last_scored_params
+    params = params or snapshot_params()
+    _last_scored_params = copy.deepcopy(params)
+    dates = dates or sorted(curated_assets_by_date)
+    CURATION_CANCEL.clear()
+    with CURATION_LOCK:
+        CURATION_STATE.update(
+            state="running", phase="rescore", days_total=len(dates), days_done=0,
+            current_date="", assets_done=0, assets_total=0, started_at=time.time(),
+            finished_at=None, error="",
+            start_date=dates[0] if dates else "",
+            end_date=dates[-1] if dates else "",
+        )
+    try:
+        for date in dates:
+            if CURATION_CANCEL.is_set():
+                print("Re-score cancelled by user; keeping days completed so far.")
+                break
+            assets = curated_assets_by_date.get(date) or []
+            with CURATION_LOCK:
+                CURATION_STATE["current_date"] = date
+                CURATION_STATE["assets_done"] = 0
+                CURATION_STATE["assets_total"] = len(assets)
+            if assets:
+                _scored, backfilled = rescore_date(assets, params)
+                if backfilled:
+                    # Crash safety: the face backfill is the slow part, persist as we go.
+                    save_checkpoint(params=params)
+                    save_feature_cache()
+            with CURATION_LOCK:
+                CURATION_STATE["days_done"] += 1
+                CURATION_STATE["assets_done"] = CURATION_STATE["assets_total"]
+        save_checkpoint(params=params)
+        save_feature_cache()
+        if CURATION_CANCEL.is_set():
+            print("Re-score cancelled; days completed so far keep their new scores.")
+        else:
+            print(f"Re-score complete for {len(dates)} day(s).")
     except BaseException as e:
         with CURATION_LOCK:
             CURATION_STATE["state"] = "error"
@@ -1222,6 +1606,27 @@ def cancel_curation():
         was_running = CURATION_STATE["state"] == "running"
     return jsonify({"ok": was_running})
 
+@app.route('/rescore', methods=['POST'])
+def rescore():
+    """Re-score the current curated results with the saved settings (no re-search).
+
+    Recomputes expression/scores/clusters from cached features in the background;
+    manual selection is preserved. Optional `date` field limits it to one day.
+    """
+    with CURATION_LOCK:
+        busy = CURATION_STATE["state"] == "running"
+    if busy:
+        return "A curation or re-score is already running.", 409
+    if not curated_assets_by_date:
+        return redirect(url_for('top'))
+    date = request.form.get("date", "")
+    if date in curated_assets_by_date:
+        dates = [date]
+    else:
+        dates = sorted(curated_assets_by_date)
+    threading.Thread(target=rescore_job, args=(snapshot_params(), dates), daemon=True).start()
+    return redirect(url_for('top'))
+
 @app.route('/top')
 def top():
     """Show top photo from each cluster per day, plus any selected non-tops."""
@@ -1253,19 +1658,41 @@ def top():
     # - if nothing is selected yet, apply the default threshold rule to top photos
     selected_ids_for_top = set(selected_asset_ids)
     if not selected_ids_for_top:
+        p = snapshot_params()
         for _date, tops in top_by_date.items():
             for a in tops:
                 score = a.get("_final_score", a.get("_total_score", 0.0))
-                if score >= DEFAULT_MIN_FINAL_SCORE and "id" in a:
+                if score >= p["default_min_final_score"] and "id" in a:
                     selected_ids_for_top.add(a["id"])
     def _card_html(asset, cluster_rank=None, show_badges=False):
         return _render_photo_card(asset, build_score_line, cluster_rank, show_badges, selected_ids_for_top)
 
+    # Re-score panel context: compare the params the scores were computed with
+    # against the live settings, and count photos needing a one-time face backfill.
+    with CURATION_LOCK:
+        running = CURATION_STATE["state"] == "running"
+    scored_params = (_checkpoint_info or {}).get("params")
+    settings_differ = scored_params is not None and (
+        params_fingerprint(scored_params) != params_fingerprint(_params)
+    )
+    backfill_needed = sum(
+        1
+        for assets in curated_assets_by_date.values()
+        for a in assets
+        if (_feature_cache.get(a.get("id")) or {}).get("faces") is None
+    )
     return render_template(
         "top.html",
         data=top_by_date,
         card_html=_card_html,
         active_page="top",
+        rescore={
+            "running": running,
+            "params": _params,
+            "settings_differ": settings_differ,
+            "backfill_needed": backfill_needed,
+            "days": sorted(curated_assets_by_date),
+        },
     )
 
 @app.route('/clusters')
@@ -1356,6 +1783,145 @@ def serve_thumbnail(asset_id):
                 _thumb_cache.clear()
             _thumb_cache[asset_id] = (resp.content, ctype)
     return resp.content, resp.status_code, _thumb_headers(ctype)
+
+
+def fetch_immich_people(max_pages: int = 2, page_size: int = 1000, ttl_sec: float = 300.0) -> list[dict]:
+    """
+    List named, non-hidden Immich people for the settings face pickers. Immich's
+    directory also holds thousands of unnamed detected faces, so we page from the
+    front (sorted by asset count) and stop at the first page with no named person.
+    Raises requests.RequestException on network/API failure.
+    """
+    global _people_cache
+    with _people_lock:
+        cached = _people_cache
+        if cached and time.time() - cached["fetched_at"] < ttl_sec:
+            return cached["people"]
+    people: list[dict] = []
+    for page in range(1, max_pages + 1):
+        resp = requests.get(
+            f"{IMMICH_URL}/api/people",
+            headers=HEADERS,
+            params={"size": page_size, "page": page},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json() or {}
+        named = [
+            {"id": p["id"], "name": p["name"]}
+            for p in data.get("people", [])
+            if p.get("id") and (p.get("name") or "").strip() and not p.get("isHidden")
+        ]
+        if not named:
+            break
+        people.extend(named)
+        if not data.get("hasNextPage"):
+            break
+    with _people_lock:
+        _people_cache = {"fetched_at": time.time(), "people": people}
+    return people
+
+
+def _safe_people() -> list[dict]:
+    """fetch_immich_people that degrades to [] (text-input fallback) on failure."""
+    try:
+        return fetch_immich_people()
+    except requests.RequestException as exc:
+        print(f"Could not list Immich people: {exc}")
+        return []
+
+
+@app.route('/api/people')
+def api_people():
+    """JSON people list for the settings page; 200 with an error field on failure."""
+    try:
+        return jsonify({"people": fetch_immich_people(), "error": ""})
+    except requests.RequestException as exc:
+        return jsonify({"people": [], "error": str(exc)})
+
+
+@app.route('/people/<person_id>/thumb')
+def serve_person_thumbnail(person_id: str):
+    """Proxy for Immich person avatars (keeps the API key server-side)."""
+    if not _UUID_RE.match(person_id):
+        return "Not found", 404
+    pid = person_id.lower()
+    with _thumb_lock:
+        cached = _person_thumb_cache.get(pid)
+    if cached is not None:
+        content, ctype = cached
+        return content, 200, _thumb_headers(ctype)
+    resp = requests.get(
+        f"{IMMICH_URL}/api/people/{pid}/thumbnail",
+        headers={"x-api-key": API_KEY},
+        timeout=15,
+    )
+    ctype = resp.headers.get('Content-Type', 'image/jpeg')
+    if resp.status_code == 200:
+        with _thumb_lock:
+            _person_thumb_cache[pid] = (resp.content, ctype)
+    return resp.content, resp.status_code, _thumb_headers(ctype)
+
+
+def _face_ids_from_form(req, name: str) -> list[str]:
+    """Face set from the form: checkboxes, unless the comma-separated fallback is used."""
+    text = (req.form.get(f"{name}_text") or "").strip()
+    if text:
+        return [piece for chunk in text.split(",") for piece in chunk.split()]
+    return req.form.getlist(name)
+
+
+@app.route('/settings', methods=['GET', 'POST'])
+def settings():
+    """View and edit the scoring params + face sets used by runs and re-scores."""
+    global _params
+    with CURATION_LOCK:
+        running = CURATION_STATE["state"] == "running"
+        phase = CURATION_STATE.get("phase", "")
+    if request.method == 'POST':
+        raw = {name: request.form.get(name, "") for name in PARAM_SPECS}
+        face_ids = _face_ids_from_form(request, "face_ids")
+        family_ids = _face_ids_from_form(request, "family_faces")
+        params, errors = sanitize_params(raw, face_ids, family_ids)
+        if errors or params is None:
+            cleaned_ids, cleaned_fam, _extra = sanitize_faces(face_ids, family_ids)
+            form_values = {**raw, "face_ids": cleaned_ids, "family_faces": cleaned_fam}
+            return render_template(
+                "settings.html",
+                specs=PARAM_SPECS, groups=PARAM_GROUPS, face_sets=FACE_SETS,
+                params=_params, people=_safe_people(), cache_stats=_face_cache_stats(),
+                running=running, phase=phase, errors=errors or ["Settings could not be saved"],
+                form_values=form_values, saved=None, active_page="settings",
+            )
+        _params = params
+        save_params()
+        return redirect(url_for('settings', saved=1))
+
+    with _feature_lock:
+        total = len(_feature_cache)
+    return render_template(
+        "settings.html",
+        specs=PARAM_SPECS, groups=PARAM_GROUPS, face_sets=FACE_SETS,
+        params=_params, people=_safe_people(), cache_stats=_face_cache_stats(),
+        running=running, phase=phase, errors=[], form_values=None,
+        saved=request.args.get("saved"), active_page="settings",
+    )
+
+
+def _face_cache_stats() -> dict:
+    """How many cached entries carry per-face rows, by detection mode."""
+    boxes = full = 0
+    with _feature_lock:
+        entries = list(_feature_cache.values())
+    for entry in entries:
+        payload = entry.get("faces")
+        if payload is None:
+            continue
+        if payload.get("mode") == "boxes":
+            boxes += 1
+        else:
+            full += 1
+    return {"boxes": boxes, "full": full, "total": len(entries)}
 
 @app.route('/submit', methods=['POST'])
 def submit():

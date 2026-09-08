@@ -19,3 +19,6 @@ curation_checkpoint.json
 
 # Per-asset feature cache (learned scores + CLIP embeddings, reusable)
 feature_cache.json
+
+# UI-editable scoring params (/settings)
+curation_params.json
