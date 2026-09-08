@@ -338,7 +338,6 @@ main.container { padding-top: 1.5rem; padding-bottom: 6rem; }
   font-size: 0.875rem;
 }
 .banner-success { background: var(--green-soft); border: 1px solid var(--green-border); color: #065f46; }
-.banner-error { background: var(--red-soft); border: 1px solid #fecaca; color: #991b1b; }
 .banner a { color: inherit; font-weight: 600; }
 .linklike {
   background: none;

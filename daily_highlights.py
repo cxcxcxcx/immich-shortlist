@@ -12,7 +12,6 @@ confirmation before adding them to an album.
 import argparse
 import calendar
 import os
-import tempfile
 import io
 import json
 import time
@@ -20,7 +19,6 @@ import base64
 import requests
 import datetime
 import threading
-import webbrowser
 from zoneinfo import ZoneInfo
 from PIL import Image
 
@@ -28,7 +26,6 @@ from PIL import Image
 import torch
 import numpy as np
 import mediapipe as mp
-from sklearn.cluster import KMeans
 from transformers import CLIPModel, CLIPProcessor
 import pyiqa
 
@@ -57,15 +54,6 @@ FAMILY_FACES = [
     "a23eb31d-3ff8-44c9-a2ea-b90819646d24",
     "8300f245-08e9-422d-8f90-96910cbd04bd",
 ]
-
-# Date Range for curation (fixed for fast demo)
-# Here we only process a single day: 2026-02-18.
-START_DATE = datetime.date(2026, 12, 1)
-END_DATE = datetime.date(2026, 12, 31)
-
-# Combined score threshold (quality + expression). Currently unused (we always take top per cluster),
-# but kept for future tuning.
-QUALITY_THRESHOLD = 0.0
 
 # Global normalization parameters (tunable; initial guesses):
 # - MUSIQ quality scores we observe are typically ~60–74
@@ -96,9 +84,6 @@ CLIP_CLUSTER_SIM_THRESHOLD = 0.9
 # The boost grows with cluster size but saturates as size increases.
 CLUSTER_TOP_WEIGHT = 0.5
 CLUSTER_TOP_MAX_SIZE = 8
-
-# Max photos to select per date (bump to 20 for debugging / more coverage)
-MAX_PHOTOS_PER_DATE = 20
 
 # Flask app configuration
 FLASK_PORT = 5724
@@ -814,7 +799,7 @@ def debug_crops(asset_id):
     )
     return html
 
-def evaluate_and_cluster(assets, _unused1, _unused2, device, clip_model, clip_processor):
+def evaluate_and_cluster(assets, device, clip_model, clip_processor):
     """
     Evaluates assets with PyIQA (quality) and MediaPipe (expression), clusters for variety.
     Returns the top scoring assets per cluster.
@@ -1111,7 +1096,7 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
             if daily_assets:
                 with CURATION_LOCK:
                     CURATION_STATE["assets_total"] = len(daily_assets)
-                ranked = evaluate_and_cluster(daily_assets, None, None, device, clip_model, clip_processor)
+                ranked = evaluate_and_cluster(daily_assets, device, clip_model, clip_processor)
                 if ranked:
                     date_key = current.strftime("%Y-%m-%d")
                     date_asset_ids = {a.get("id") for a in ranked if a.get("id")}
@@ -1279,8 +1264,6 @@ def top():
     return render_template(
         "top.html",
         data=top_by_date,
-        selected_ids=selected_ids_for_top,
-        score_line=build_score_line,
         card_html=_card_html,
         active_page="top",
     )
@@ -1315,8 +1298,6 @@ def clusters():
     return render_template(
         "clusters.html",
         data=sorted_data,
-        selected_ids=selected_asset_ids,
-        score_line=build_score_line,
         card_html=_card_html,
         active_page="clusters",
     )
@@ -1345,8 +1326,6 @@ def deep_view_date(date_str):
         "date_view.html",
         date=date_str,
         assets=assets,
-        selected_ids=selected_asset_ids,
-        score_line=build_score_line,
         card_html=_card_html,
         active_page="",
     )
