@@ -16,3 +16,6 @@ wheels/
 
 # Curation checkpoint (runtime data, restored on startup)
 curation_checkpoint.json
+
+# Per-asset feature cache (learned scores + CLIP embeddings, reusable)
+feature_cache.json

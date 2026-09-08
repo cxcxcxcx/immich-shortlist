@@ -202,7 +202,40 @@ def discard_checkpoint() -> None:
         os.remove(CHECKPOINT_PATH)
 
 
+# Per-asset feature cache: the expensive, image-derived quantities (MUSIQ
+# quality, MediaPipe expression summary, CLIP embedding). Deterministic per
+# image, so they are reusable across runs and date ranges; only new assets
+# pay inference cost again. Bump the version when models or preprocessing
+# change.
+FEATURE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_cache.json")
+FEATURE_CACHE_VERSION = 1
+_feature_cache: dict[str, dict] = {}
+_feature_lock = threading.Lock()
+
+
+def load_feature_cache() -> None:
+    global _feature_cache
+    if not os.path.exists(FEATURE_CACHE_PATH):
+        return
+    with open(FEATURE_CACHE_PATH) as f:
+        data = json.load(f)
+    if data.get("version") != FEATURE_CACHE_VERSION:
+        print(f"Ignoring feature cache version {data.get('version')} (want {FEATURE_CACHE_VERSION}).")
+        return
+    _feature_cache = data.get("assets", {})
+    print(f"Loaded feature cache: {len(_feature_cache)} assets.")
+
+
+def save_feature_cache() -> None:
+    """Atomically persist the per-asset feature cache."""
+    tmp = FEATURE_CACHE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"version": FEATURE_CACHE_VERSION, "assets": _feature_cache}, f)
+    os.replace(tmp, FEATURE_CACHE_PATH)
+
+
 load_checkpoint()
+load_feature_cache()
 
 
 def _pil_to_data_url(img: Image.Image) -> str:
@@ -804,27 +837,45 @@ def evaluate_and_cluster(assets, _unused1, _unused2, device, clip_model, clip_pr
         with CURATION_LOCK:
             CURATION_STATE["assets_done"] = idx
         asset_id = asset.get("id")
-        img = download_thumbnail(asset_id)
-        if img is None:
-            continue
 
-        # 1. Image quality scores via MUSIQ (PyIQA). Higher = better quality.
-        img_t = _pil_to_tensor_01(img)  # (1,3,H,W), CPU tensor
-        q_tensor = _musiq_metric(img_t)
-        raw_q = float(q_tensor.item())
-        if not np.isfinite(raw_q):
-            raw_q = QUALITY_MEAN
+        with _feature_lock:
+            cached = _feature_cache.get(asset_id)
+        if cached is not None:
+            # Cache hit: reuse the stored quality/expression/CLIP features.
+            raw_q = cached["q"]
+            expr = cached["e"]
+            summary = cached.get("sum") or {}
+            feats = np.frombuffer(base64.b64decode(cached["clip"]), dtype=np.float32)
+            print(f"    [cache] asset={asset_id} expr={float(expr):.3f} (reused)")
+        else:
+            img = download_thumbnail(asset_id)
+            if img is None:
+                continue
 
-        # 2. Expression via MediaPipe Face Landmarker.
-        expr, summary = _expression_from_mediapipe(img, asset)
-        print(f"    [expr] asset={asset_id} expr={expr:.3f} summary={summary}")
+            # 1. Image quality scores via MUSIQ (PyIQA). Higher = better quality.
+            img_t = _pil_to_tensor_01(img)  # (1,3,H,W), CPU tensor
+            q_tensor = _musiq_metric(img_t)
+            raw_q = float(q_tensor.item())
+            if not np.isfinite(raw_q):
+                raw_q = QUALITY_MEAN
 
-        # 3. CLIP embedding for clustering.
-        with torch.no_grad():
-            clip_inputs = clip_processor(images=img, return_tensors="pt").to(device)
-            feats = clip_model.get_image_features(**clip_inputs)
-            feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
-        clip_feats.append(feats.squeeze(0).cpu().numpy().astype(np.float32))
+            # 2. Expression via MediaPipe Face Landmarker.
+            expr, summary = _expression_from_mediapipe(img, asset)
+            print(f"    [expr] asset={asset_id} expr={expr:.3f} summary={summary}")
+
+            # 3. CLIP embedding for clustering.
+            with torch.no_grad():
+                clip_inputs = clip_processor(images=img, return_tensors="pt").to(device)
+                feats = clip_model.get_image_features(**clip_inputs)
+                feats = feats / (feats.norm(dim=-1, keepdim=True) + 1e-8)
+            feats = feats.squeeze(0).cpu().numpy().astype(np.float32)
+            with _feature_lock:
+                _feature_cache[asset_id] = {
+                    "q": raw_q,
+                    "e": expr,
+                    "sum": summary or {},
+                    "clip": base64.b64encode(feats.tobytes()).decode("ascii"),
+                }
 
         # Stash metrics on asset and in lists.
         asset["_quality_score"] = raw_q
@@ -835,6 +886,7 @@ def evaluate_and_cluster(assets, _unused1, _unused2, device, clip_model, clip_pr
         valid_assets.append(asset)
         quality_scores.append(raw_q)
         expression_scores.append(expr)
+        clip_feats.append(feats)
 
     if not valid_assets:
         return []
@@ -1074,12 +1126,14 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
                         curated_assets_by_date[date_key] = ranked
                         # Per-day checkpoint: a crash loses at most the current day.
                         save_checkpoint()
+                        save_feature_cache()
             with CURATION_LOCK:
                 CURATION_STATE["days_done"] += 1
                 CURATION_STATE["assets_done"] = CURATION_STATE["assets_total"]
             current += datetime.timedelta(days=1)
         recompute_default_selection()
         save_checkpoint()
+        save_feature_cache()
         if CURATION_CANCEL.is_set():
             print("Curation cancelled by user; days completed so far are kept.")
         else:
