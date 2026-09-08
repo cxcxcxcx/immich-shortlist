@@ -1165,15 +1165,15 @@ def build_score_line(asset: dict) -> str:
     return " ".join(parts)
 
 
-def _render_asset_card_body(asset, score_line_fn, cluster_rank=None, show_base=False, show_badges=False):
-    """Render shared card body HTML (stats under photo) for cluster, date, and top views."""
+def _render_photo_card(asset, score_line_fn, cluster_rank=None, show_badges=False, selected_ids=frozenset()):
+    """Render one selectable photo card (image + score overlay + details) for all gallery views."""
     return render_template(
-        "partials/card_body.html",
+        "partials/photo_card.html",
         asset=asset,
         score_line=score_line_fn,
         cluster_rank=cluster_rank,
-        show_base=show_base,
         show_badges=show_badges,
+        selected_ids=selected_ids,
     )
 
 
@@ -1273,23 +1273,23 @@ def top():
                 score = a.get("_final_score", a.get("_total_score", 0.0))
                 if score >= DEFAULT_MIN_FINAL_SCORE and "id" in a:
                     selected_ids_for_top.add(a["id"])
-    def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
-        return _render_asset_card_body(asset, build_score_line, cluster_rank, show_base, show_badges)
+    def _card_html(asset, cluster_rank=None, show_badges=False):
+        return _render_photo_card(asset, build_score_line, cluster_rank, show_badges, selected_ids_for_top)
 
     return render_template(
         "top.html",
         data=top_by_date,
         selected_ids=selected_ids_for_top,
         score_line=build_score_line,
-        card_body_html=_card_body,
+        card_html=_card_html,
         active_page="top",
     )
 
 @app.route('/clusters')
 def clusters():
     """Cluster debug view with all ranked assets. Sorted by cluster then by top score (best first)."""
-    def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
-        return _render_asset_card_body(asset, build_score_line, cluster_rank, show_base, show_badges)
+    def _card_html(asset, cluster_rank=None, show_badges=False):
+        return _render_photo_card(asset, build_score_line, cluster_rank, show_badges, selected_asset_ids)
 
     # Per date: sort by cluster top score (so best clusters first), then by score within cluster
     def _sorted_assets(assets):
@@ -1317,7 +1317,7 @@ def clusters():
         data=sorted_data,
         selected_ids=selected_asset_ids,
         score_line=build_score_line,
-        card_body_html=_card_body,
+        card_html=_card_html,
         active_page="clusters",
     )
 
@@ -1338,8 +1338,8 @@ def deep_view_date(date_str):
         save_checkpoint()
         return redirect(url_for('clusters'))
 
-    def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
-        return _render_asset_card_body(asset, build_score_line, cluster_rank, show_base, show_badges)
+    def _card_html(asset, cluster_rank=None, show_badges=False):
+        return _render_photo_card(asset, build_score_line, cluster_rank, show_badges, selected_asset_ids)
 
     return render_template(
         "date_view.html",
@@ -1347,7 +1347,7 @@ def deep_view_date(date_str):
         assets=assets,
         selected_ids=selected_asset_ids,
         score_line=build_score_line,
-        card_body_html=_card_body,
+        card_html=_card_html,
         active_page="",
     )
 

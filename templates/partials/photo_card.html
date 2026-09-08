@@ -1,0 +1,35 @@
+<div class="photo-card">
+    {# The whole photo is a label for the hidden checkbox: tapping anywhere flips selection. #}
+    <label class="card-hit">
+        <input class="visually-hidden" type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
+        <img src="{{ url_for('serve_thumbnail', asset_id=asset.id) }}" alt="Thumbnail" loading="lazy" decoding="async">
+        <span class="overlay-top">
+            <span class="check-bubble">✓</span>
+            <span class="pill-group">
+                {% if show_badges %}
+                <span class="pill">C{{ asset._cluster_id }}</span>
+                <span class="pill">n{{ asset._cluster_size }}</span>
+                {% endif %}
+                {% if cluster_rank is not none %}
+                <span class="pill">#{{ cluster_rank }}</span>
+                {% endif %}
+            </span>
+        </span>
+        <span class="overlay-bottom">
+            <span class="score-big">{{ "%.2f"|format(asset._final_score if asset._final_score is defined else asset._total_score) }}<span class="score-cap">final</span></span>
+            <span class="score-sub">A {{ "%.1f"|format(asset._quality_score) }} · E {{ "%.2f"|format(asset._expression_score) }} · {{ asset._person_match_count or 1 }} face{{ 's' if (asset._person_match_count or 1) > 1 }}</span>
+        </span>
+    </label>
+    <details class="card-more">
+        <summary>Details</summary>
+        <div class="card-detail">
+            <div>{{ score_line(asset)|safe }}</div>
+            {% if asset._expression_emotions %}
+            <div>
+                {% for name, val in asset._expression_emotions.items() %}{{ name }} {{ "%.1f"|format(val) }}{% if not loop.last %} · {% endif %}{% endfor %}
+            </div>
+            {% endif %}
+            <a class="debug-link" href="{{ url_for('debug_crops', asset_id=asset.id) }}" target="_blank">Debug crops →</a>
+        </div>
+    </details>
+</div>

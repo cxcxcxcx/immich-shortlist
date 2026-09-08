@@ -27,15 +27,7 @@
         <div class="cluster-head">Cluster {{ cluster_id }} · {{ cluster_assets|length }} photos</div>
         <div class="grid">
             {% for asset in cluster_assets %}
-            <div class="photo-card">
-                <div class="photo-frame">
-                    <img src="{{ url_for('serve_thumbnail', asset_id=asset.id) }}" alt="Thumbnail" loading="lazy" decoding="async">
-                    <label class="check-chip">
-                        <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
-                    </label>
-                </div>
-                {{ card_body_html(asset, loop.index, false, false)|safe }}
-            </div>
+            {{ card_html(asset, loop.index)|safe }}
             {% endfor %}
         </div>
         {% endfor %}
