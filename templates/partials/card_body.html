@@ -1,0 +1,30 @@
+<div class="card-body">
+    {% if show_badges %}
+    <div class="badge-row">
+        <span class="badge">Cluster {{ asset._cluster_id }}</span>
+        <span class="badge">n={{ asset._cluster_size }}</span>
+    </div>
+    {% endif %}
+    <div class="score-main">
+        <span class="score-value">{{ "%.2f"|format(asset._final_score if asset._final_score is defined else asset._total_score) }}</span>
+        <span class="score-label">final</span>
+        {% if cluster_rank is not none %}
+        <span class="mini">rank #{{ cluster_rank }}</span>
+        {% endif %}
+    </div>
+    {% if show_base %}
+    <div class="mini">Base {{ "%.3f"|format(asset._base_score) }}{% if asset._cluster_top_boost is defined %} · top boost +{{ "%.3f"|format(asset._cluster_top_boost) }}{% endif %}</div>
+    {% endif %}
+    <div class="mini">{{ score_line(asset)|safe }}</div>
+    <dl class="stats">
+        <div><dt>Aes</dt><dd>{{ "%.2f"|format(asset._quality_score) }}</dd></div>
+        <div><dt>Expr</dt><dd>{{ "%.2f"|format(asset._expression_score) }}</dd></div>
+        <div><dt>Faces</dt><dd>{{ asset._person_match_count or 1 }}</dd></div>
+    </dl>
+    {% if asset._expression_emotions %}
+    <div class="mini">
+        {% for name, val in asset._expression_emotions.items() %}{{ name }} {{ "%.1f"|format(val) }}{% if not loop.last %} · {% endif %}{% endfor %}
+    </div>
+    {% endif %}
+    <a class="debug-link" href="{{ url_for('debug_crops', asset_id=asset.id) }}" target="_blank">Debug crops →</a>
+</div>

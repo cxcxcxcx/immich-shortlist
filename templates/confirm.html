@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Submission — Photo Curator{% endblock %}
+{% block container_class %}container-narrow{% endblock %}
+{% block content %}
+<div class="confirm-wrap">
+    <div class="card confirm-card">
+        {% if status == 'ok' %}
+        <div class="confirm-icon ok">✓</div>
+        <h1>Added {{ count }} photos to the album</h1>
+        <p>They're in Immich now — run the pixtale sync to publish them to the gallery.</p>
+        {% elif status == 'empty' %}
+        <div class="confirm-icon warn">!</div>
+        <h1>No photos selected</h1>
+        <p>Tick at least one photo before submitting.</p>
+        {% else %}
+        <div class="confirm-icon err">✕</div>
+        <h1>Submission failed</h1>
+        <p>Check the server console for the error, then try again.</p>
+        {% endif %}
+        <div class="confirm-actions">
+            <a class="btn btn-primary" href="{{ url_for('top') }}">Top picks</a>
+            <a class="btn btn-ghost" href="{{ url_for('clusters') }}">Clusters</a>
+            <a class="btn btn-ghost" href="{{ url_for('index') }}">New run</a>
+        </div>
+    </div>
+</div>
+{% endblock %}

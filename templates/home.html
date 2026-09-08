@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}New run — Photo Curator{% endblock %}
+{% block container_class %}container-narrow{% endblock %}
+{% block content %}
+<div class="page-head">
+    <h1>Curation run</h1>
+    <p>Search both kids' faces in a date range, score aesthetics &amp; expression, cluster by similarity, then pick.</p>
+</div>
+
+{% if checkpoint %}
+<div class="banner banner-success">
+    <span>
+        Restored last results: <strong>{{ checkpoint.days }} day(s)</strong>, saved {{ checkpoint.saved_at }}{% if checkpoint.submitted %} · <strong>already submitted</strong>{% endif %}.
+        See <a href="{{ url_for('top') }}">top picks</a> or <a href="{{ url_for('clusters') }}">all clusters</a>.
+    </span>
+    <form action="{{ url_for('checkpoint_discard') }}" method="POST">
+        <button type="submit" class="linklike">discard</button>
+    </form>
+</div>
+{% endif %}
+
+<div class="home-grid">
+    <form id="curation-form" action="{{ url_for('process') }}" method="POST" class="card card-pad">
+        <h2 class="section-title">Date range</h2>
+        <p class="form-hint" style="margin-top:0">Click a start date, then an end date. Both ends are inclusive.</p>
+        <div class="form-group">
+            <span class="form-label">Quick pick</span>
+            <div class="chips" id="presets">
+                <button type="button" class="chip" data-preset="last7">Last 7 days</button>
+                <button type="button" class="chip" data-preset="last30">Last 30 days</button>
+                <button type="button" class="chip" data-preset="thisMonth">This month</button>
+                <button type="button" class="chip" data-preset="lastMonth">Last month</button>
+            </div>
+        </div>
+        <div class="form-group">
+            <div id="calendar" class="calendar"></div>
+            <div id="range-summary" class="range-summary empty">Pick a start date to begin</div>
+        </div>
+        <input type="hidden" name="start_date" id="start_date" required>
+        <input type="hidden" name="end_date" id="end_date" required>
+        <div class="form-group">
+            <label class="check-row">
+                <input type="checkbox" name="skip_in_album" value="1">
+                <span>Skip days whose candidates are already in the album</span>
+            </label>
+        </div>
+        <button type="submit" id="run-btn" class="btn btn-primary btn-block" disabled>Run curation</button>
+        <p class="form-hint" style="text-align:center">Ranges over 40 days ask for confirmation before starting.</p>
+    </form>
+
+    <div id="progress-panel" class="card card-pad progress-card" style="display:none">
+        <div class="progress-head">
+            <span class="status-dot running"></span>
+            <h2 class="section-title" style="margin:0">Curation running</h2>
+        </div>
+        <p id="progress-range" class="mini" style="margin:0.2rem 0 0.6rem"></p>
+        <div class="bar-track"><div id="bar" class="bar-fill active"></div></div>
+        <p id="progress-text" class="progress-text"></p>
+        <p class="form-hint">Safe to leave this page open — when the run finishes you'll be taken to the top picks automatically.</p>
+        <button id="cancel-btn" type="button" class="btn btn-danger btn-sm">Stop this run</button>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='home.js') }}"></script>{% endblock %}

@@ -33,7 +33,7 @@ from transformers import CLIPModel, CLIPProcessor
 import pyiqa
 
 # Web UI
-from flask import Flask, render_template_string, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify
 
 # ==========================================
 # CONFIGURATION
@@ -1167,8 +1167,8 @@ def build_score_line(asset: dict) -> str:
 
 def _render_asset_card_body(asset, score_line_fn, cluster_rank=None, show_base=False, show_badges=False):
     """Render shared card body HTML (stats under photo) for cluster, date, and top views."""
-    return render_template_string(
-        ASSET_CARD_BODY_TEMPLATE,
+    return render_template(
+        "partials/card_body.html",
         asset=asset,
         score_line=score_line_fn,
         cluster_rank=cluster_rank,
@@ -1177,366 +1177,14 @@ def _render_asset_card_body(asset, score_line_fn, cluster_rank=None, show_base=F
     )
 
 
-# Shared card body: stats under the photo. Used by cluster view, date view, and top view.
-ASSET_CARD_BODY_TEMPLATE = """
-<div class="card-body">
-{% if show_badges %}
-<div class="badge">Cluster {{ asset._cluster_id }}</div>
-<div class="badge">Cluster Size {{ asset._cluster_size }}</div>
-<div style="margin-top: 0.5rem;"></div>
-{% endif %}
-{% if cluster_rank is not none %}
-Cluster Rank: <span class="score">#{{ cluster_rank }}</span><br>
-{% endif %}
-{% if show_base %}
-Base: <span class="score">{{ "%.3f"|format(asset._base_score) }}</span><br>
-{% if asset._cluster_top_boost is defined %}
-Top-in-cluster boost: <span class="score">+{{ "%.3f"|format(asset._cluster_top_boost) }}</span><br>
-{% endif %}
-{% endif %}
-<span class="score">Final: {{ "%.3f"|format(asset._final_score if asset._final_score is defined else asset._total_score) }}</span><br>
-<span style="font-size: 0.75rem; color:#4b5563;">{{ score_line(asset)|safe }}</span>
-<div style="color: #71717a; font-size: 0.75rem; margin-top: 0.35rem;">
-Aesthetics: {{ "%.2f"|format(asset._quality_score) }}<br>
-Expression: {{ "%.2f"|format(asset._expression_score) }}<br>
-Face hits: {{ asset._person_match_count or 1 }}<br>
-{% if asset._expression_emotions %}
-<span style="display:block; margin-top: 0.25rem;">
-{% for name, val in asset._expression_emotions.items() %}
-{{ name }}={{ "%.1f"|format(val) }}{% if not loop.last %}, {% endif %}
-{% endfor %}
-</span>
-{% endif %}
-</div>
-<a href="/debug/crops/{{ asset.id }}" target="_blank" style="font-size: 0.75rem; margin-top: 0.35rem; display: inline-block;">Debug crops</a>
-</div>
-"""
-
 # ==========================================
-# 4. FLASK WEB UI ROUTES
+# 4. FLASK WEB UI ROUTES  (templates live in ./templates, styles/scripts in ./static)
 # ==========================================
-
-HOME_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Immich Album Curator</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f4f5; color: #18181b; padding: 2rem; }
-        .container { max-width: 560px; margin: 4rem auto; }
-        h1 { border-bottom: 2px solid #e4e4e7; padding-bottom: 1rem; margin-bottom: 1.5rem; }
-        .form-group { margin-bottom: 1.25rem; }
-        .form-group label { display: block; font-weight: 600; margin-bottom: 0.35rem; }
-        .form-group input[type="date"] { width: 100%; padding: 0.5rem 0.75rem; font-size: 1rem; border: 1px solid #d4d4d8; border-radius: 8px; }
-        .btn { background: #2563eb; color: white; border: none; padding: 0.75rem 1.5rem; font-size: 1rem; border-radius: 8px; cursor: pointer; }
-        .btn:hover { background: #1d4ed8; }
-        .hint { font-size: 0.85rem; color: #71717a; margin-top: 0.25rem; }
-        .bar-outer { background: #e4e4e7; border-radius: 8px; height: 14px; overflow: hidden; margin: 0.5rem 0 0.75rem; }
-        .bar-inner { background: #2563eb; height: 100%; width: 0; transition: width 0.5s; }
-        .checkpoint { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-size: 0.9rem; }
-        .linklike { background: none; border: none; color: #2563eb; cursor: pointer; padding: 0; font-size: 0.9rem; text-decoration: underline; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Immich Album Curator</h1>
-        {% if checkpoint %}
-        <div class="checkpoint">
-            Restored last results: {{ checkpoint.days }} day(s), saved {{ checkpoint.saved_at }}{% if checkpoint.submitted %} · <b>already submitted</b>{% endif %}.
-            See <a href="/top">top picks</a> or <a href="/clusters">all clusters</a>.
-            <form action="/checkpoint/discard" method="POST" style="display:inline">
-                <button type="submit" class="linklike">discard</button>
-            </form>
-        </div>
-        {% endif %}
-        <p style="color:#71717a; margin-bottom: 1.5rem;">Choose a date range. On submit, the app will search for faces, score aesthetics and expression, cluster by CLIP, then show candidates.</p>
-        <div id="progress-panel" style="display:none;">
-            <h2 style="font-size:1.1rem; margin-bottom:0.25rem;">Curation running&hellip;</h2>
-            <p id="progress-range" style="color:#71717a; margin:0;"></p>
-            <div class="bar-outer"><div id="bar" class="bar-inner"></div></div>
-            <p id="progress-text" style="font-weight:600;"></p>
-            <p class="hint">Safe to leave this page open &mdash; when the run finishes you'll be taken to the top picks automatically.</p>
-            <button id="cancel-btn" type="button" class="btn" style="background:#dc2626;">Stop this run</button>
-        </div>
-        <form id="curation-form" action="/process" method="POST">
-            <div class="form-group">
-                <label for="start_date">Start date</label>
-                <input type="date" id="start_date" name="start_date" required>
-            </div>
-            <div class="form-group">
-                <label for="end_date">End date</label>
-                <input type="date" id="end_date" name="end_date" required>
-                <span class="hint">Inclusive.</span>
-            </div>
-            <div class="form-group">
-                <label>
-                    <input type="checkbox" name="skip_in_album" value="1">
-                    Skip days where all candidates are already in the album
-                </label>
-            </div>
-            <button type="submit" class="btn">Run curation for date range</button>
-        </form>
-    </div>
-    <script>
-    const panel = document.getElementById('progress-panel');
-    const form = document.getElementById('curation-form');
-    const bar = document.getElementById('bar');
-    const text = document.getElementById('progress-text');
-    const rangeEl = document.getElementById('progress-range');
-    const cancelBtn = document.getElementById('cancel-btn');
-    let armed = false;
-    function fmtSecs(s) {
-        const m = Math.floor(s / 60), r = s % 60;
-        return m > 0 ? m + 'm ' + r + 's' : r + 's';
-    }
-    cancelBtn.addEventListener('click', async () => {
-        cancelBtn.disabled = true;
-        text.textContent = 'Stopping after the current day…';
-        try { await fetch('/cancel', {method: 'POST'}); } catch (e) {}
-    });
-    form.addEventListener('submit', function (ev) {
-        const s = form.start_date.value, e = form.end_date.value;
-        if (s && e) {
-            const days = Math.round((new Date(e) - new Date(s)) / 86400000) + 1;
-            if (days > 40 && !confirm('About to curate ' + days + ' days — this can take a long time. Continue?')) {
-                ev.preventDefault();
-            }
-        }
-    });
-    async function poll() {
-        let s;
-        try { s = await (await fetch('/progress')).json(); } catch (e) { setTimeout(poll, 4000); return; }
-        if (s.state === 'running') {
-            armed = true;
-            cancelBtn.disabled = false;
-            panel.style.display = 'block';
-            form.style.display = 'none';
-            rangeEl.textContent = (s.start_date || '') + ' → ' + (s.end_date || '');
-            const pct = s.days_total ? Math.round(100 * s.days_done / s.days_total) : 0;
-            bar.style.width = pct + '%';
-            const assets = s.assets_total ? ' · photo ' + s.assets_done + '/' + s.assets_total : '';
-            text.textContent = 'Day ' + Math.min(s.days_done + 1, s.days_total) + '/' + s.days_total +
-                ' — ' + (s.current_date || '') + assets + ' · ' + fmtSecs(s.elapsed_sec || 0) + ' elapsed';
-            setTimeout(poll, 2000);
-        } else if (s.state === 'done') {
-            if (armed) { text.textContent = 'Done — opening top picks…'; setTimeout(() => { location.href = '/top'; }, 800); }
-        } else if (s.state === 'cancelled') {
-            if (armed) {
-                text.textContent = 'Stopped. Days completed so far are kept — see top picks.';
-                form.style.display = 'block';
-            }
-        } else if (s.state === 'error') {
-            panel.style.display = 'block';
-            form.style.display = 'none';
-            text.textContent = 'Run failed: ' + s.error;
-        } else {
-            setTimeout(poll, 4000);
-        }
-    }
-    poll();
-    </script>
-</body>
-</html>
-"""
-
-# A clean, modern HTML template to review clusters and scores
-CLUSTERS_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Immich Album Curator</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f4f5; color: #18181b; padding: 2rem; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { border-bottom: 2px solid #e4e4e7; padding-bottom: 1rem; }
-        .date-section { margin-bottom: 3rem; background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
-        .date-title { margin-top: 0; color: #2563eb; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1.5rem; }
-        .card { background: #fafafa; border: 1px solid #e4e4e7; border-radius: 8px; overflow: hidden; position: relative; }
-        .card img { width: 100%; height: 200px; object-fit: cover; display: block; }
-        .card-body { padding: 0.75rem; font-size: 0.875rem; }
-        .score { font-weight: bold; color: #059669; }
-        .checkbox-container { position: absolute; top: 8px; left: 8px; background: white; padding: 4px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .checkbox-container input { width: 18px; height: 18px; cursor: pointer; }
-        .btn { background: #2563eb; color: white; border: none; padding: 1rem 2rem; font-size: 1.1rem; border-radius: 8px; cursor: pointer; display: block; width: 100%; margin-top: 2rem; transition: background 0.2s; }
-        .btn:hover { background: #1d4ed8; }
-        .no-results { text-align: center; color: #71717a; padding: 3rem; }
-        .nav { margin-bottom: 1rem; font-size: 0.85rem; color: #4b5563; }
-        .nav a { color: #2563eb; text-decoration: none; margin-right: 0.75rem; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="nav">
-            <a href="/">Home</a>
-            <a href="/top">Daily top picks</a>
-        </div>
-        <h1>Clustered Aesthetic & Expression Scores</h1>
-        
-        {% if not data %}
-            <div class="no-results">
-                <h2>No photos met the criteria.</h2>
-                <p>Pick a date range on the <a href="/">home page</a> and run curation.</p>
-            </div>
-        {% else %}
-            <form action="/submit" method="POST">
-                {% for date, assets in data.items() %}
-                    <div class="date-section">
-                        <h2 class="date-title">{{ date }} ({{ assets|length }} photos)</h2>
-
-                        {% for cluster_id, cluster_assets in assets|groupby('_cluster_id') %}
-                            <h3>Cluster {{ cluster_id }} ({{ cluster_assets|length }} photos)</h3>
-                            <div class="grid">
-                                {% for asset in cluster_assets %}
-                                    <div class="card">
-                                        <div class="checkbox-container">
-                                            <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
-                                        </div>
-                                        <img src="/thumb/{{ asset.id }}" alt="Thumbnail" loading="lazy" decoding="async">
-                                        {{ card_body_html(asset, loop.index, false, false)|safe }}
-                                    </div>
-                                {% endfor %}
-                            </div>
-                        {% endfor %}
-                    </div>
-                {% endfor %}
-                
-                <button type="submit" class="btn">Confirm & Add Selected to Album</button>
-            </form>
-        {% endif %}
-    </div>
-</body>
-</html>
-"""
-
-DATE_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Immich Album Curator - {{ date }}</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f4f5; color: #18181b; padding: 2rem; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { border-bottom: 2px solid #e4e4e7; padding-bottom: 1rem; }
-        .date-section { margin-bottom: 3rem; background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1.5rem; }
-        .card { background: #fafafa; border: 1px solid #e4e4e7; border-radius: 8px; overflow: hidden; position: relative; }
-        .card img { width: 100%; height: 220px; object-fit: cover; display: block; }
-        .card-body { padding: 0.75rem; font-size: 0.875rem; }
-        .score { font-weight: bold; color: #059669; }
-        .checkbox-container { position: absolute; top: 8px; left: 8px; background: white; padding: 4px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .checkbox-container input { width: 18px; height: 18px; cursor: pointer; }
-        .btn { background: #2563eb; color: white; border: none; padding: 1rem 2rem; font-size: 1.1rem; border-radius: 8px; cursor: pointer; display: block; width: 100%; margin-top: 2rem; transition: background 0.2s; }
-        .btn:hover { background: #1d4ed8; }
-        .nav { margin-bottom: 1rem; font-size: 0.85rem; color: #4b5563; }
-        .nav a { color: #2563eb; text-decoration: none; margin-right: 0.75rem; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="nav">
-            <a href="/">Home</a>
-            <a href="/top">Daily top picks</a>
-            <a href="/clusters">Cluster view</a>
-        </div>
-        <h1>Deep view for {{ date }}</h1>
-        <form action="" method="POST">
-            <div class="date-section">
-                {% for cluster_id, cluster_assets in assets|groupby('_cluster_id') %}
-                    <h3>Cluster {{ cluster_id }} ({{ cluster_assets|length }} photos)</h3>
-                    <div class="grid">
-                        {% for asset in cluster_assets %}
-                            <div class="card">
-                                <div class="checkbox-container">
-                                    <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
-                                </div>
-                                <img src="/thumb/{{ asset.id }}" alt="Thumbnail" loading="lazy" decoding="async">
-                                {{ card_body_html(asset, loop.index, true, false)|safe }}
-                            </div>
-                        {% endfor %}
-                    </div>
-                {% endfor %}
-            </div>
-            <button type="submit" class="btn">Save selection for this day</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-TOP_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Immich Album Curator - Daily Top Picks</title>
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f4f5; color: #18181b; padding: 2rem; }
-        .container { max-width: 1200px; margin: 0 auto; }
-        h1 { border-bottom: 2px solid #e4e4e7; padding-bottom: 1rem; }
-        .date-section { margin-bottom: 3rem; background: white; padding: 1.5rem; border-radius: 12px; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); }
-        .date-title { margin-top: 0; color: #2563eb; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 1.5rem; }
-        .card { background: #fafafa; border: 1px solid #e4e4e7; border-radius: 8px; overflow: hidden; position: relative; }
-        .card img { width: 100%; height: 220px; object-fit: cover; display: block; }
-        .card-body { padding: 0.75rem; font-size: 0.875rem; }
-        .score { font-weight: bold; color: #059669; }
-        .badge { display: inline-block; background: #e0f2fe; color: #0369a1; padding: 0.15rem 0.4rem; border-radius: 999px; font-size: 0.7rem; margin-right: 0.25rem; }
-        .nav { margin-bottom: 1rem; font-size: 0.85rem; color: #4b5563; }
-        .nav a { color: #2563eb; text-decoration: none; margin-right: 0.75rem; }
-        .deep-link { font-size: 0.85rem; margin-left: 0.5rem; }
-        .checkbox-container { position: absolute; top: 8px; left: 8px; background: white; padding: 4px; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .checkbox-container input { width: 18px; height: 18px; cursor: pointer; }
-        .btn { background: #2563eb; color: white; border: none; padding: 1rem 2rem; font-size: 1.1rem; border-radius: 8px; cursor: pointer; display: block; width: 100%; margin-top: 2rem; transition: background 0.2s; }
-        .btn:hover { background: #1d4ed8; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="nav">
-            <a href="/">Home</a>
-            <a href="/top">Daily top picks</a>
-            <a href="/clusters">Cluster view</a>
-        </div>
-        <h1>Daily Top Picks Across Clusters</h1>
-        
-        {% if not data %}
-            <div class="no-results">
-                <h2>No photos for this range.</h2>
-                <p>Pick a date range on the <a href="/">home page</a> and run curation.</p>
-            </div>
-        {% else %}
-            <form action="/submit" method="POST">
-                {% for date, assets in data.items() %}
-                    <div class="date-section">
-                        <h2 class="date-title">
-                            {{ date }} ({{ assets|length }} photos)
-                            <a class="deep-link" href="/date/{{ date }}">Deep view for this day</a>
-                        </h2>
-                        <div class="grid">
-                            {% for asset in assets %}
-                                <div class="card">
-                                    <div class="checkbox-container">
-                                        <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
-                                    </div>
-                                    <img src="/thumb/{{ asset.id }}" alt="Thumbnail" loading="lazy" decoding="async">
-                                    {{ card_body_html(asset, none, false, true)|safe }}
-                                </div>
-                            {% endfor %}
-                        </div>
-                    </div>
-                {% endfor %}
-                <button type="submit" class="btn">Add selected to album</button>
-            </form>
-        {% endif %}
-    </div>
-</body>
-</html>
-"""
 
 @app.route('/')
 def index():
     """Home: date range form to trigger curation on demand."""
-    return render_template_string(HOME_TEMPLATE, checkpoint=_checkpoint_info)
+    return render_template("home.html", checkpoint=_checkpoint_info, active_page="home")
 
 
 @app.route('/checkpoint/discard', methods=['POST'])
@@ -1628,12 +1276,13 @@ def top():
     def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
         return _render_asset_card_body(asset, build_score_line, cluster_rank, show_base, show_badges)
 
-    return render_template_string(
-        TOP_TEMPLATE,
+    return render_template(
+        "top.html",
         data=top_by_date,
         selected_ids=selected_ids_for_top,
         score_line=build_score_line,
         card_body_html=_card_body,
+        active_page="top",
     )
 
 @app.route('/clusters')
@@ -1663,12 +1312,13 @@ def clusters():
         for date, assets in curated_assets_by_date.items()
     }
 
-    return render_template_string(
-        CLUSTERS_TEMPLATE,
+    return render_template(
+        "clusters.html",
         data=sorted_data,
         selected_ids=selected_asset_ids,
         score_line=build_score_line,
         card_body_html=_card_body,
+        active_page="clusters",
     )
 
 
@@ -1691,13 +1341,14 @@ def deep_view_date(date_str):
     def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
         return _render_asset_card_body(asset, build_score_line, cluster_rank, show_base, show_badges)
 
-    return render_template_string(
-        DATE_TEMPLATE,
+    return render_template(
+        "date_view.html",
         date=date_str,
         assets=assets,
         selected_ids=selected_asset_ids,
         score_line=build_score_line,
         card_body_html=_card_body,
+        active_page="",
     )
 
 def _thumb_headers(ctype: str) -> dict:
@@ -1751,23 +1402,7 @@ def confirm():
     """Separate confirmation page after submission."""
     status = request.args.get("status", "ok")
     count = request.args.get("count", "0")
-    if status == "empty":
-        body = "<h3>No assets selected!</h3><p><a href='/'>Go back</a></p>"
-    elif status == "ok":
-        body = f"""
-            <h2 style="color:green; text-align:center; margin-top:50px;">
-                Successfully added {count} assets to album!
-            </h2>
-            <p style="text-align:center;"><a href='/clusters'>Back to clusters</a></p>
-        """
-    else:
-        body = """
-            <h2 style='color:red; text-align:center; margin-top:50px;'>
-                Failed to add to album. Check server console for errors.
-            </h2>
-            <p style="text-align:center;"><a href='/clusters'>Back to clusters</a></p>
-        """
-    return f"<!DOCTYPE html><html><head><title>Submission Result</title></head><body>{body}</body></html>"
+    return render_template("confirm.html", status=status, count=count, active_page="")
 
 # ==========================================
 # 5. ENTRY POINT

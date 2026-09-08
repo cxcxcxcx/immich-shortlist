@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Top picks — Photo Curator{% endblock %}
+{% block content %}
+<div class="page-head">
+    <h1>Daily top picks</h1>
+    <p>Best photo of each cluster per day. Selections stay in sync with the deep views.</p>
+</div>
+
+{% if not data %}
+<div class="card"><div class="empty-state">
+    <h2>No photos for this range yet</h2>
+    <p>Run a curation from the <a href="{{ url_for('index') }}">home page</a> first.</p>
+</div></div>
+{% else %}
+<form action="{{ url_for('submit') }}" method="POST" data-gallery-form>
+    {% for date, assets in data.items() %}
+    <section class="card day-section">
+        <header class="day-head">
+            <div><span class="day-title">{{ date }}</span><span class="day-count">{{ assets|length }} photos</span></div>
+            <div class="day-tools">
+                <a class="mini-link" href="{{ url_for('deep_view_date', date_str=date) }}">Deep view</a>
+                <button type="button" class="mini-link js-all">All</button>
+                <button type="button" class="mini-link js-none">None</button>
+            </div>
+        </header>
+        <div class="grid">
+            {% for asset in assets %}
+            <div class="photo-card">
+                <div class="photo-frame">
+                    <img src="{{ url_for('serve_thumbnail', asset_id=asset.id) }}" alt="Thumbnail" loading="lazy" decoding="async">
+                    <label class="check-chip">
+                        <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
+                    </label>
+                </div>
+                {{ card_body_html(asset, none, false, true)|safe }}
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+    {% endfor %}
+    <div class="action-bar">
+        <div class="action-info"><strong id="sel-count">0</strong> selected</div>
+        <button type="submit" id="submit-selected" class="btn btn-primary" data-label="Add selected to album">Add selected to album</button>
+    </div>
+</form>
+{% endif %}
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='gallery.js') }}"></script>{% endblock %}

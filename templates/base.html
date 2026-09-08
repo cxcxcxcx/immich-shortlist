@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}Photo Curator{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<nav class="navbar">
+    <div class="container navbar-inner">
+        <a class="brand" href="{{ url_for('index') }}"><span class="brand-dot"></span>Photo Curator</a>
+        <div class="nav-links">
+            <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'home' }}">New run</a>
+            <a href="{{ url_for('top') }}" class="{{ 'active' if active_page == 'top' }}">Top picks</a>
+            <a href="{{ url_for('clusters') }}" class="{{ 'active' if active_page == 'clusters' }}">Clusters</a>
+        </div>
+    </div>
+</nav>
+<main class="container {% block container_class %}{% endblock %}">
+    {% block content %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>

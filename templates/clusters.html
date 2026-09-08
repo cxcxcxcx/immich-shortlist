@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Clusters — Photo Curator{% endblock %}
+{% block content %}
+<div class="page-head">
+    <h1>Clusters</h1>
+    <p>All candidates, grouped by similarity cluster per day — best clusters first.</p>
+</div>
+
+{% if not data %}
+<div class="card"><div class="empty-state">
+    <h2>No photos met the criteria</h2>
+    <p>Pick a date range on the <a href="{{ url_for('index') }}">home page</a> and run curation.</p>
+</div></div>
+{% else %}
+<form action="{{ url_for('submit') }}" method="POST" data-gallery-form>
+    {% for date, assets in data.items() %}
+    <section class="card day-section">
+        <header class="day-head">
+            <div><span class="day-title">{{ date }}</span><span class="day-count">{{ assets|length }} photos</span></div>
+            <div class="day-tools">
+                <a class="mini-link" href="{{ url_for('deep_view_date', date_str=date) }}">Deep view</a>
+                <button type="button" class="mini-link js-all">All</button>
+                <button type="button" class="mini-link js-none">None</button>
+            </div>
+        </header>
+        {% for cluster_id, cluster_assets in assets|groupby('_cluster_id') %}
+        <div class="cluster-head">Cluster {{ cluster_id }} · {{ cluster_assets|length }} photos</div>
+        <div class="grid">
+            {% for asset in cluster_assets %}
+            <div class="photo-card">
+                <div class="photo-frame">
+                    <img src="{{ url_for('serve_thumbnail', asset_id=asset.id) }}" alt="Thumbnail" loading="lazy" decoding="async">
+                    <label class="check-chip">
+                        <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
+                    </label>
+                </div>
+                {{ card_body_html(asset, loop.index, false, false)|safe }}
+            </div>
+            {% endfor %}
+        </div>
+        {% endfor %}
+    </section>
+    {% endfor %}
+    <div class="action-bar">
+        <div class="action-info"><strong id="sel-count">0</strong> selected</div>
+        <button type="submit" id="submit-selected" class="btn btn-primary" data-label="Confirm & add selected to album">Confirm &amp; add selected to album</button>
+    </div>
+</form>
+{% endif %}
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='gallery.js') }}"></script>{% endblock %}
