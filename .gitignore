@@ -13,3 +13,6 @@ wheels/
 *.task
 *.task.*
 *.tflite
+
+# Curation checkpoint (runtime data, restored on startup)
+curation_checkpoint.json

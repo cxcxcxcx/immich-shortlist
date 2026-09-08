@@ -14,6 +14,7 @@ import calendar
 import os
 import tempfile
 import io
+import json
 import time
 import base64
 import requests
@@ -32,7 +33,7 @@ from transformers import CLIPModel, CLIPProcessor
 import pyiqa
 
 # Web UI
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import Flask, render_template_string, request, redirect, url_for, jsonify
 
 # ==========================================
 # CONFIGURATION
@@ -126,6 +127,78 @@ _models_cache = None
 _musiq_metric = None
 # Cache for per-asset face metadata fetched from Immich
 _faces_cache: dict[str, list[dict]] = {}
+# In-memory thumbnail cache (Immich thumbnails are immutable per asset id).
+_thumb_cache: dict[str, tuple[bytes, str]] = {}
+_thumb_lock = threading.Lock()
+# Live progress of a curation run (written by the job thread, read by /progress).
+CURATION_LOCK = threading.Lock()
+CURATION_STATE = {
+    "state": "idle",  # idle | running | done | error
+    "days_total": 0,
+    "days_done": 0,
+    "current_date": "",
+    "assets_done": 0,
+    "assets_total": 0,
+    "started_at": None,
+    "finished_at": None,
+    "error": "",
+}
+# On-disk checkpoint of curation results, so restarts don't lose them.
+CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_checkpoint.json")
+_checkpoint_info: dict | None = None
+
+
+def save_checkpoint(submitted: bool = False) -> None:
+    """Atomically write curated results + selection to disk."""
+    global _checkpoint_info
+    data = {
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "submitted": submitted,
+        "curated_assets_by_date": curated_assets_by_date,
+        "selected_asset_ids": sorted(selected_asset_ids),
+    }
+    tmp = CHECKPOINT_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, default=float)
+    os.replace(tmp, CHECKPOINT_PATH)
+    _checkpoint_info = {
+        "days": len(curated_assets_by_date),
+        "saved_at": data["saved_at"],
+        "submitted": submitted,
+    }
+
+
+def load_checkpoint() -> None:
+    """Restore curated results from the checkpoint file, if present."""
+    global curated_assets_by_date, selected_asset_ids, _checkpoint_info
+    if not os.path.exists(CHECKPOINT_PATH):
+        return
+    with open(CHECKPOINT_PATH) as f:
+        data = json.load(f)
+    curated_assets_by_date = data["curated_assets_by_date"]
+    selected_asset_ids = set(data["selected_asset_ids"])
+    _checkpoint_info = {
+        "days": len(curated_assets_by_date),
+        "saved_at": data.get("saved_at", ""),
+        "submitted": bool(data.get("submitted")),
+    }
+    print(
+        f"Restored checkpoint from {_checkpoint_info['saved_at']} "
+        f"({len(curated_assets_by_date)} days, submitted={_checkpoint_info['submitted']})."
+    )
+
+
+def discard_checkpoint() -> None:
+    """Throw away the checkpoint file and the in-memory results."""
+    global curated_assets_by_date, selected_asset_ids, _checkpoint_info
+    curated_assets_by_date = {}
+    selected_asset_ids = set()
+    _checkpoint_info = None
+    if os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+
+
+load_checkpoint()
 
 
 def _pil_to_data_url(img: Image.Image) -> str:
@@ -724,6 +797,8 @@ def evaluate_and_cluster(assets, _unused1, _unused2, device, clip_model, clip_pr
         _musiq_metric = pyiqa.create_metric("musiq", device="cpu")
 
     for idx, asset in enumerate(assets):
+        with CURATION_LOCK:
+            CURATION_STATE["assets_done"] = idx
         asset_id = asset.get("id")
         img = download_thumbnail(asset_id)
         if img is None:
@@ -947,34 +1022,64 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
     """
     Run search + scoring + clustering for each day in [start_date, end_date]
     and populate curated_assets_by_date. Call this from /process when user submits dates.
+    Updates CURATION_STATE for the /progress endpoint and checkpoints to disk per day.
     """
     global curated_assets_by_date, selected_asset_ids
-    curated_assets_by_date = {}
-    selected_asset_ids = set()
-    device, clip_model, clip_processor = load_models()
-    existing_album_ids = set()
-    if skip_dates_already_in_album:
-        existing_album_ids = get_album_asset_ids(ALBUM_ID)
-    current = start_date
-    while current <= end_date:
-        daily_assets = search_assets_for_date(current, FACE_IDS)
-        if daily_assets:
-            ranked = evaluate_and_cluster(daily_assets, None, None, device, clip_model, clip_processor)
-            if ranked:
-                date_key = current.strftime("%Y-%m-%d")
-                date_asset_ids = {a.get("id") for a in ranked if a.get("id")}
-                if (
-                    skip_dates_already_in_album
-                    and existing_album_ids
-                    and date_asset_ids
-                    and date_asset_ids.issubset(existing_album_ids)
-                ):
-                    print(f"Skipping {date_key}: all candidates already in album.")
-                else:
-                    curated_assets_by_date[date_key] = ranked
-        current += datetime.timedelta(days=1)
-    recompute_default_selection()
-    print("Curation complete for selected date range.")
+    days_total = (end_date - start_date).days + 1
+    with CURATION_LOCK:
+        CURATION_STATE.update(
+            state="running", days_total=days_total, days_done=0, current_date="",
+            assets_done=0, assets_total=0, started_at=time.time(),
+            finished_at=None, error="",
+        )
+    try:
+        curated_assets_by_date = {}
+        selected_asset_ids = set()
+        device, clip_model, clip_processor = load_models()
+        existing_album_ids = set()
+        if skip_dates_already_in_album:
+            existing_album_ids = get_album_asset_ids(ALBUM_ID)
+        current = start_date
+        while current <= end_date:
+            with CURATION_LOCK:
+                CURATION_STATE["current_date"] = current.strftime("%Y-%m-%d")
+                CURATION_STATE["assets_done"] = 0
+                CURATION_STATE["assets_total"] = 0
+            daily_assets = search_assets_for_date(current, FACE_IDS)
+            if daily_assets:
+                with CURATION_LOCK:
+                    CURATION_STATE["assets_total"] = len(daily_assets)
+                ranked = evaluate_and_cluster(daily_assets, None, None, device, clip_model, clip_processor)
+                if ranked:
+                    date_key = current.strftime("%Y-%m-%d")
+                    date_asset_ids = {a.get("id") for a in ranked if a.get("id")}
+                    if (
+                        skip_dates_already_in_album
+                        and existing_album_ids
+                        and date_asset_ids
+                        and date_asset_ids.issubset(existing_album_ids)
+                    ):
+                        print(f"Skipping {date_key}: all candidates already in album.")
+                    else:
+                        curated_assets_by_date[date_key] = ranked
+                        # Per-day checkpoint: a crash loses at most the current day.
+                        save_checkpoint()
+            with CURATION_LOCK:
+                CURATION_STATE["days_done"] += 1
+                CURATION_STATE["assets_done"] = CURATION_STATE["assets_total"]
+            current += datetime.timedelta(days=1)
+        recompute_default_selection()
+        save_checkpoint()
+        print("Curation complete for selected date range.")
+    except BaseException as e:
+        with CURATION_LOCK:
+            CURATION_STATE["state"] = "error"
+            CURATION_STATE["error"] = f"{type(e).__name__}: {e}"
+            CURATION_STATE["finished_at"] = time.time()
+        raise
+    with CURATION_LOCK:
+        CURATION_STATE["state"] = "done"
+        CURATION_STATE["finished_at"] = time.time()
 
 
 def build_score_line(asset: dict) -> str:
@@ -1059,13 +1164,32 @@ HOME_TEMPLATE = """
         .btn { background: #2563eb; color: white; border: none; padding: 0.75rem 1.5rem; font-size: 1rem; border-radius: 8px; cursor: pointer; }
         .btn:hover { background: #1d4ed8; }
         .hint { font-size: 0.85rem; color: #71717a; margin-top: 0.25rem; }
+        .bar-outer { background: #e4e4e7; border-radius: 8px; height: 14px; overflow: hidden; margin: 0.5rem 0 0.75rem; }
+        .bar-inner { background: #2563eb; height: 100%; width: 0; transition: width 0.5s; }
+        .checkpoint { background: #ecfdf5; border: 1px solid #a7f3d0; border-radius: 8px; padding: 0.75rem 1rem; margin-bottom: 1.5rem; font-size: 0.9rem; }
+        .linklike { background: none; border: none; color: #2563eb; cursor: pointer; padding: 0; font-size: 0.9rem; text-decoration: underline; }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Immich Album Curator</h1>
+        {% if checkpoint %}
+        <div class="checkpoint">
+            Restored last results: {{ checkpoint.days }} day(s), saved {{ checkpoint.saved_at }}{% if checkpoint.submitted %} · <b>already submitted</b>{% endif %}.
+            See <a href="/top">top picks</a> or <a href="/clusters">all clusters</a>.
+            <form action="/checkpoint/discard" method="POST" style="display:inline">
+                <button type="submit" class="linklike">discard</button>
+            </form>
+        </div>
+        {% endif %}
         <p style="color:#71717a; margin-bottom: 1.5rem;">Choose a date range. On submit, the app will search for faces, score aesthetics and expression, cluster by CLIP, then show candidates.</p>
-        <form action="/process" method="POST">
+        <div id="progress-panel" style="display:none;">
+            <h2 style="font-size:1.1rem; margin-bottom:0.25rem;">Curation running&hellip;</h2>
+            <div class="bar-outer"><div id="bar" class="bar-inner"></div></div>
+            <p id="progress-text" style="font-weight:600;"></p>
+            <p class="hint">Safe to leave this page open &mdash; when the run finishes you'll be taken to the top picks automatically.</p>
+        </div>
+        <form id="curation-form" action="/process" method="POST">
             <div class="form-group">
                 <label for="start_date">Start date</label>
                 <input type="date" id="start_date" name="start_date" required>
@@ -1084,6 +1208,41 @@ HOME_TEMPLATE = """
             <button type="submit" class="btn">Run curation for date range</button>
         </form>
     </div>
+    <script>
+    const panel = document.getElementById('progress-panel');
+    const form = document.getElementById('curation-form');
+    const bar = document.getElementById('bar');
+    const text = document.getElementById('progress-text');
+    let armed = false;
+    function fmtSecs(s) {
+        const m = Math.floor(s / 60), r = s % 60;
+        return m > 0 ? m + 'm ' + r + 's' : r + 's';
+    }
+    async function poll() {
+        let s;
+        try { s = await (await fetch('/progress')).json(); } catch (e) { setTimeout(poll, 4000); return; }
+        if (s.state === 'running') {
+            armed = true;
+            panel.style.display = 'block';
+            form.style.display = 'none';
+            const pct = s.days_total ? Math.round(100 * s.days_done / s.days_total) : 0;
+            bar.style.width = pct + '%';
+            const assets = s.assets_total ? ' · photo ' + s.assets_done + '/' + s.assets_total : '';
+            text.textContent = 'Day ' + Math.min(s.days_done + 1, s.days_total) + '/' + s.days_total +
+                ' — ' + (s.current_date || '') + assets + ' · ' + fmtSecs(s.elapsed_sec || 0) + ' elapsed';
+            setTimeout(poll, 2000);
+        } else if (s.state === 'done') {
+            if (armed) { text.textContent = 'Done — opening top picks…'; setTimeout(() => { location.href = '/top'; }, 800); }
+        } else if (s.state === 'error') {
+            panel.style.display = 'block';
+            form.style.display = 'none';
+            text.textContent = 'Run failed: ' + s.error;
+        } else {
+            setTimeout(poll, 4000);
+        }
+    }
+    poll();
+    </script>
 </body>
 </html>
 """
@@ -1141,7 +1300,7 @@ CLUSTERS_TEMPLATE = """
                                         <div class="checkbox-container">
                                             <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
                                         </div>
-                                        <img src="/thumb/{{ asset.id }}" alt="Thumbnail">
+                                        <img src="/thumb/{{ asset.id }}" alt="Thumbnail" loading="lazy" decoding="async">
                                         {{ card_body_html(asset, loop.index, false, false)|safe }}
                                     </div>
                                 {% endfor %}
@@ -1199,7 +1358,7 @@ DATE_TEMPLATE = """
                                 <div class="checkbox-container">
                                     <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
                                 </div>
-                                <img src="/thumb/{{ asset.id }}" alt="Thumbnail">
+                                <img src="/thumb/{{ asset.id }}" alt="Thumbnail" loading="lazy" decoding="async">
                                 {{ card_body_html(asset, loop.index, true, false)|safe }}
                             </div>
                         {% endfor %}
@@ -1267,7 +1426,7 @@ TOP_TEMPLATE = """
                                     <div class="checkbox-container">
                                         <input type="checkbox" name="asset_ids" value="{{ asset.id }}" {% if asset.id in selected_ids %}checked{% endif %}>
                                     </div>
-                                    <img src="/thumb/{{ asset.id }}" alt="Thumbnail">
+                                    <img src="/thumb/{{ asset.id }}" alt="Thumbnail" loading="lazy" decoding="async">
                                     {{ card_body_html(asset, none, false, true)|safe }}
                                 </div>
                             {% endfor %}
@@ -1285,12 +1444,19 @@ TOP_TEMPLATE = """
 @app.route('/')
 def index():
     """Home: date range form to trigger curation on demand."""
-    return render_template_string(HOME_TEMPLATE)
+    return render_template_string(HOME_TEMPLATE, checkpoint=_checkpoint_info)
+
+
+@app.route('/checkpoint/discard', methods=['POST'])
+def checkpoint_discard():
+    """Throw away the restored checkpoint (file + in-memory results)."""
+    discard_checkpoint()
+    return redirect(url_for('index'))
 
 
 @app.route('/process', methods=['POST'])
 def process():
-    """Run curation for the submitted date range, then show top picks."""
+    """Start curation for the submitted date range in a background thread."""
     start_s = request.form.get('start_date')
     end_s = request.form.get('end_date')
     skip_in_album = bool(request.form.get('skip_in_album'))
@@ -1301,8 +1467,26 @@ def process():
     end_date = datetime.datetime.strptime(end_s, '%Y-%m-%d').date()
     if start_date > end_date:
         start_date, end_date = end_date, start_date
-    run_curation_for_date_range(start_date, end_date, skip_dates_already_in_album=skip_in_album)
-    return redirect(url_for('top'))
+    with CURATION_LOCK:
+        if CURATION_STATE["state"] == "running":
+            return "A curation run is already in progress — watch it on the home page.", 409
+    threading.Thread(
+        target=run_curation_for_date_range,
+        args=(start_date, end_date),
+        kwargs={"skip_dates_already_in_album": skip_in_album},
+        daemon=True,
+    ).start()
+    return redirect(url_for('index'))
+
+
+@app.route('/progress')
+def progress():
+    """JSON snapshot of the curation run; polled by the home page."""
+    with CURATION_LOCK:
+        snap = dict(CURATION_STATE)
+    if snap["started_at"]:
+        snap["elapsed_sec"] = int((snap["finished_at"] or time.time()) - snap["started_at"])
+    return jsonify(snap)
 
 @app.route('/top')
 def top():
@@ -1400,6 +1584,7 @@ def deep_view_date(date_str):
         posted = set(request.form.getlist("asset_ids"))
         selected_asset_ids -= date_ids
         selected_asset_ids |= (posted & date_ids)
+        save_checkpoint()
         return redirect(url_for('clusters'))
 
     def _card_body(asset, cluster_rank=None, show_base=False, show_badges=False):
@@ -1414,15 +1599,32 @@ def deep_view_date(date_str):
         card_body_html=_card_body,
     )
 
+def _thumb_headers(ctype: str) -> dict:
+    # Asset thumbnails never change for a given id, so let the browser cache hard.
+    return {"Content-Type": ctype, "Cache-Control": "public, max-age=86400, immutable"}
+
+
 @app.route('/thumb/<asset_id>')
 def serve_thumbnail(asset_id):
     """
-    Acts as a proxy to fetch thumbnails securely from Immich to display in our UI 
-    without leaking the API key to the browser.
+    Acts as a proxy to fetch thumbnails securely from Immich to display in our UI
+    without leaking the API key to the browser. Served from an in-memory cache on
+    repeat requests.
     """
+    with _thumb_lock:
+        cached = _thumb_cache.get(asset_id)
+    if cached is not None:
+        content, ctype = cached
+        return content, 200, _thumb_headers(ctype)
     url = f"{IMMICH_URL}/api/assets/{asset_id}/thumbnail?size=thumbnail"
-    resp = requests.get(url, headers={"x-api-key": API_KEY})
-    return resp.content, resp.status_code, {'Content-Type': resp.headers.get('Content-Type', 'image/jpeg')}
+    resp = requests.get(url, headers={"x-api-key": API_KEY}, timeout=30)
+    ctype = resp.headers.get('Content-Type', 'image/jpeg')
+    if resp.status_code == 200:
+        with _thumb_lock:
+            if len(_thumb_cache) >= 2000:
+                _thumb_cache.clear()
+            _thumb_cache[asset_id] = (resp.content, ctype)
+    return resp.content, resp.status_code, _thumb_headers(ctype)
 
 @app.route('/submit', methods=['POST'])
 def submit():
@@ -1437,6 +1639,7 @@ def submit():
     
     if success:
         print("Success! You can safely terminate this script (Ctrl+C).")
+        save_checkpoint(submitted=True)
         return redirect(url_for('confirm', status="ok", count=len(selected_ids)))
     else:
         return redirect(url_for('confirm', status="error"))
@@ -1517,9 +1720,10 @@ if __name__ == "__main__":
         success = add_assets_to_album(ALBUM_ID, selected_ids)
         if success:
             print(f"Successfully added {len(selected_ids)} assets to the album.")
+            save_checkpoint(submitted=True)
         else:
             print("Failed to add assets to the album.")
             exit(1)
         exit(0)
 
-    app.run(port=FLASK_PORT, debug=True, use_reloader=True)
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=True, use_reloader=True)
