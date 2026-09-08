@@ -133,7 +133,7 @@ _thumb_lock = threading.Lock()
 # Live progress of a curation run (written by the job thread, read by /progress).
 CURATION_LOCK = threading.Lock()
 CURATION_STATE = {
-    "state": "idle",  # idle | running | done | error
+    "state": "idle",  # idle | running | done | cancelled | error
     "days_total": 0,
     "days_done": 0,
     "current_date": "",
@@ -142,7 +142,11 @@ CURATION_STATE = {
     "started_at": None,
     "finished_at": None,
     "error": "",
+    "start_date": "",
+    "end_date": "",
 }
+# Set by /cancel; the job checks it between days.
+CURATION_CANCEL = threading.Event()
 # On-disk checkpoint of curation results, so restarts don't lose them.
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_checkpoint.json")
 _checkpoint_info: dict | None = None
@@ -1026,11 +1030,14 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
     """
     global curated_assets_by_date, selected_asset_ids
     days_total = (end_date - start_date).days + 1
+    CURATION_CANCEL.clear()
     with CURATION_LOCK:
         CURATION_STATE.update(
             state="running", days_total=days_total, days_done=0, current_date="",
             assets_done=0, assets_total=0, started_at=time.time(),
             finished_at=None, error="",
+            start_date=start_date.strftime("%Y-%m-%d"),
+            end_date=end_date.strftime("%Y-%m-%d"),
         )
     try:
         curated_assets_by_date = {}
@@ -1041,6 +1048,9 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
             existing_album_ids = get_album_asset_ids(ALBUM_ID)
         current = start_date
         while current <= end_date:
+            if CURATION_CANCEL.is_set():
+                print("Curation cancelled by user; keeping days completed so far.")
+                break
             with CURATION_LOCK:
                 CURATION_STATE["current_date"] = current.strftime("%Y-%m-%d")
                 CURATION_STATE["assets_done"] = 0
@@ -1070,7 +1080,10 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
             current += datetime.timedelta(days=1)
         recompute_default_selection()
         save_checkpoint()
-        print("Curation complete for selected date range.")
+        if CURATION_CANCEL.is_set():
+            print("Curation cancelled by user; days completed so far are kept.")
+        else:
+            print("Curation complete for selected date range.")
     except BaseException as e:
         with CURATION_LOCK:
             CURATION_STATE["state"] = "error"
@@ -1078,7 +1091,7 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
             CURATION_STATE["finished_at"] = time.time()
         raise
     with CURATION_LOCK:
-        CURATION_STATE["state"] = "done"
+        CURATION_STATE["state"] = "cancelled" if CURATION_CANCEL.is_set() else "done"
         CURATION_STATE["finished_at"] = time.time()
 
 
@@ -1185,9 +1198,11 @@ HOME_TEMPLATE = """
         <p style="color:#71717a; margin-bottom: 1.5rem;">Choose a date range. On submit, the app will search for faces, score aesthetics and expression, cluster by CLIP, then show candidates.</p>
         <div id="progress-panel" style="display:none;">
             <h2 style="font-size:1.1rem; margin-bottom:0.25rem;">Curation running&hellip;</h2>
+            <p id="progress-range" style="color:#71717a; margin:0;"></p>
             <div class="bar-outer"><div id="bar" class="bar-inner"></div></div>
             <p id="progress-text" style="font-weight:600;"></p>
             <p class="hint">Safe to leave this page open &mdash; when the run finishes you'll be taken to the top picks automatically.</p>
+            <button id="cancel-btn" type="button" class="btn" style="background:#dc2626;">Stop this run</button>
         </div>
         <form id="curation-form" action="/process" method="POST">
             <div class="form-group">
@@ -1213,18 +1228,36 @@ HOME_TEMPLATE = """
     const form = document.getElementById('curation-form');
     const bar = document.getElementById('bar');
     const text = document.getElementById('progress-text');
+    const rangeEl = document.getElementById('progress-range');
+    const cancelBtn = document.getElementById('cancel-btn');
     let armed = false;
     function fmtSecs(s) {
         const m = Math.floor(s / 60), r = s % 60;
         return m > 0 ? m + 'm ' + r + 's' : r + 's';
     }
+    cancelBtn.addEventListener('click', async () => {
+        cancelBtn.disabled = true;
+        text.textContent = 'Stopping after the current day…';
+        try { await fetch('/cancel', {method: 'POST'}); } catch (e) {}
+    });
+    form.addEventListener('submit', function (ev) {
+        const s = form.start_date.value, e = form.end_date.value;
+        if (s && e) {
+            const days = Math.round((new Date(e) - new Date(s)) / 86400000) + 1;
+            if (days > 40 && !confirm('About to curate ' + days + ' days — this can take a long time. Continue?')) {
+                ev.preventDefault();
+            }
+        }
+    });
     async function poll() {
         let s;
         try { s = await (await fetch('/progress')).json(); } catch (e) { setTimeout(poll, 4000); return; }
         if (s.state === 'running') {
             armed = true;
+            cancelBtn.disabled = false;
             panel.style.display = 'block';
             form.style.display = 'none';
+            rangeEl.textContent = (s.start_date || '') + ' → ' + (s.end_date || '');
             const pct = s.days_total ? Math.round(100 * s.days_done / s.days_total) : 0;
             bar.style.width = pct + '%';
             const assets = s.assets_total ? ' · photo ' + s.assets_done + '/' + s.assets_total : '';
@@ -1233,6 +1266,11 @@ HOME_TEMPLATE = """
             setTimeout(poll, 2000);
         } else if (s.state === 'done') {
             if (armed) { text.textContent = 'Done — opening top picks…'; setTimeout(() => { location.href = '/top'; }, 800); }
+        } else if (s.state === 'cancelled') {
+            if (armed) {
+                text.textContent = 'Stopped. Days completed so far are kept — see top picks.';
+                form.style.display = 'block';
+            }
         } else if (s.state === 'error') {
             panel.style.display = 'block';
             form.style.display = 'none';
@@ -1487,6 +1525,15 @@ def progress():
     if snap["started_at"]:
         snap["elapsed_sec"] = int((snap["finished_at"] or time.time()) - snap["started_at"])
     return jsonify(snap)
+
+
+@app.route('/cancel', methods=['POST'])
+def cancel_curation():
+    """Ask the running curation job to stop after the day it is on."""
+    CURATION_CANCEL.set()
+    with CURATION_LOCK:
+        was_running = CURATION_STATE["state"] == "running"
+    return jsonify({"ok": was_running})
 
 @app.route('/top')
 def top():
