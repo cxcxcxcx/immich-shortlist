@@ -22,3 +22,11 @@ feature_cache.json
 
 # UI-editable scoring params (/settings)
 curation_params.json
+
+# Job subprocess runtime files (request/status/cancel flag + child log)
+curation_job.json
+curation_job.json.tmp
+curation_job_status.json
+curation_job_status.json.tmp
+curation_job_cancel
+curation_job.log

@@ -15,6 +15,7 @@ import copy
 import ctypes
 import gc
 import os
+import subprocess
 import sys
 import io
 import json
@@ -1742,9 +1743,171 @@ def checkpoint_discard():
     return redirect(url_for('index'))
 
 
+# ==========================================
+# JOB SUBPROCESS: curation/rescore run in a child process that exits afterwards
+# ==========================================
+# The ML stack costs ~1.25 GB to import (torch, TensorFlow via mediapipe,
+# pyiqa) and the cached models another ~0.7 GB, and none of it can be
+# unloaded from a live Python process. So instead of running jobs in a
+# thread, the routes spawn `python daily_highlights.py --run-job <req.json>`
+# — a fresh interpreter that imports the ML stack, does the work, persists
+# results through the normal checkpoint + feature-cache files, and exits,
+# handing all of that memory back to the OS. The parent keeps a watcher
+# thread that mirrors the child's progress file into CURATION_STATE for
+# /progress, and reloads results from the checkpoint when it finishes.
+JOB_REQUEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job.json")
+JOB_STATUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job_status.json")
+JOB_CANCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job_cancel")
+JOB_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job.log")
+_CURATION_PROC: subprocess.Popen | None = None
+_JOB_START_LOCK = threading.Lock()
+_STATUS_LOCK = threading.Lock()  # dumper thread + job finally both write the status file
+
+
+def _write_job_status() -> None:
+    """Atomically dump CURATION_STATE (+ pid) for the parent's watcher."""
+    with _STATUS_LOCK, CURATION_LOCK:
+        snap = dict(CURATION_STATE)
+        snap["pid"] = os.getpid()
+    tmp = JOB_STATUS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(snap, f)
+    os.replace(tmp, JOB_STATUS_PATH)
+
+
+def _run_job_child(request_path: str) -> None:
+    """Worker entry point (`--run-job`): run one job, persist, exit.
+
+    Progress is published by rewriting the status file every second; a cancel
+    is requested by the parent creating the cancel-flag file.
+    """
+    with open(request_path) as f:
+        job = json.load(f)
+    os.remove(request_path)
+    stop = threading.Event()
+
+    def dumper() -> None:
+        while not stop.is_set():
+            _write_job_status()
+            stop.wait(1.0)
+        # The finally block below writes the final state once the job thread is done.
+
+    def cancel_watcher() -> None:
+        while not stop.is_set():
+            if os.path.exists(JOB_CANCEL_PATH):
+                CURATION_CANCEL.set()
+                return
+            stop.wait(0.5)
+
+    threading.Thread(target=dumper, daemon=True).start()
+    threading.Thread(target=cancel_watcher, daemon=True).start()
+    code = 0
+    try:
+        if job["type"] == "curation":
+            run_curation_for_date_range(
+                datetime.date.fromisoformat(job["start_date"]),
+                datetime.date.fromisoformat(job["end_date"]),
+                skip_dates_already_in_album=bool(job.get("skip_in_album")),
+                params=job.get("params"),
+            )
+        elif job["type"] == "rescore":
+            rescore_job(job.get("params"), job.get("dates"))
+        else:
+            raise ValueError(f"unknown job type {job['type']!r}")
+    except BaseException as e:
+        print(f"job failed: {type(e).__name__}: {e}")
+        code = 1
+    finally:
+        stop.set()
+        _write_job_status()
+        if os.path.exists(JOB_CANCEL_PATH):
+            os.remove(JOB_CANCEL_PATH)
+    # Hard-exit instead of returning: mediapipe's native dispatcher thread
+    # crashes during interpreter teardown (turning a successful job into a
+    # nonzero exit), and there is nothing left to clean up anyway — the job
+    # already persisted results through the checkpoint + feature-cache files.
+    sys.stdout.flush()
+    os._exit(code)
+
+
+def _job_busy() -> bool:
+    """True when a job subprocess is alive here OR was left running by a previous server process."""
+    if _CURATION_PROC is not None and _CURATION_PROC.poll() is None:
+        return True
+    try:
+        with open(JOB_STATUS_PATH) as f:
+            pid = json.load(f).get("pid")
+        if pid and pid != os.getpid():
+            os.kill(pid, 0)  # raises ProcessLookupError if that process is gone
+            return True
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def _watch_job(proc: subprocess.Popen) -> None:
+    """Mirror the child's status file into CURATION_STATE; absorb results on exit."""
+    global _CURATION_PROC
+    code = None
+    while True:
+        code = proc.poll()
+        try:
+            with open(JOB_STATUS_PATH) as f:
+                final = json.load(f)
+            final.pop("pid", None)
+            with CURATION_LOCK:
+                CURATION_STATE.update(final)
+        except (OSError, ValueError):
+            pass
+        if code is not None:
+            break
+        time.sleep(1.0)
+    if code == 0:
+        with CURATION_LOCK:
+            if CURATION_STATE["state"] == "running":  # child exited without a final write
+                CURATION_STATE.update(state="done", finished_at=time.time())
+        # Pull the child's results and its feature-cache additions into this process.
+        load_checkpoint()
+        with _feature_lock:
+            load_feature_cache()
+    else:
+        with CURATION_LOCK:
+            CURATION_STATE.update(
+                state="error",
+                error=CURATION_STATE.get("error") or f"job process exited with code {code} (see curation_job.log)",
+                finished_at=time.time(),
+            )
+    _CURATION_PROC = None
+
+
+def _start_job(job: dict) -> None:
+    """Write the request file, spawn the worker child, start the watcher."""
+    global _CURATION_PROC
+    with _JOB_START_LOCK:
+        tmp = JOB_REQUEST_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(job, f)
+        os.replace(tmp, JOB_REQUEST_PATH)
+        for stale in (JOB_CANCEL_PATH, JOB_STATUS_PATH):
+            if os.path.exists(stale):
+                os.remove(stale)
+        log = open(JOB_LOG_PATH, "a")
+        # start_new_session: a debug-reloader restart kills this server but not a running job.
+        _CURATION_PROC = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--run-job", JOB_REQUEST_PATH],
+            stdout=log, stderr=subprocess.STDOUT, start_new_session=True,
+        )
+    with CURATION_LOCK:
+        CURATION_STATE.update(
+            state="running", phase="starting", started_at=time.time(), finished_at=None,
+            error="", current_date="", days_done=0, days_total=0, assets_done=0, assets_total=0,
+        )
+    threading.Thread(target=_watch_job, args=(_CURATION_PROC,), daemon=True).start()
+
+
 @app.route('/process', methods=['POST'])
 def process():
-    """Start curation for the submitted date range in a background thread."""
+    """Start curation for the submitted date range in a worker subprocess."""
     start_s = request.form.get('start_date')
     end_s = request.form.get('end_date')
     skip_in_album = bool(request.form.get('skip_in_album'))
@@ -1758,12 +1921,15 @@ def process():
     with CURATION_LOCK:
         if CURATION_STATE["state"] == "running":
             return "A curation run is already in progress — watch it on the home page.", 409
-    threading.Thread(
-        target=run_curation_for_date_range,
-        args=(start_date, end_date),
-        kwargs={"skip_dates_already_in_album": skip_in_album},
-        daemon=True,
-    ).start()
+    if _job_busy():
+        return "A previous curation job process is still running — watch it on the home page.", 409
+    _start_job({
+        "type": "curation",
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "skip_in_album": skip_in_album,
+        "params": snapshot_params(),
+    })
     return redirect(url_for('index'))
 
 
@@ -1781,6 +1947,10 @@ def progress():
 def cancel_curation():
     """Ask the running curation job to stop after the day it is on."""
     CURATION_CANCEL.set()
+    proc = _CURATION_PROC
+    if proc is not None and proc.poll() is None:
+        # The child's cancel-watcher polls for this flag file.
+        open(JOB_CANCEL_PATH, "w").close()
     with CURATION_LOCK:
         was_running = CURATION_STATE["state"] == "running"
     return jsonify({"ok": was_running})
@@ -1796,6 +1966,8 @@ def rescore():
         busy = CURATION_STATE["state"] == "running"
     if busy:
         return "A curation or re-score is already running.", 409
+    if _job_busy():
+        return "A previous curation job process is still running — try again in a moment.", 409
     if not curated_assets_by_date:
         return redirect(url_for('top'))
     date = request.form.get("date", "")
@@ -1803,7 +1975,7 @@ def rescore():
         dates = [date]
     else:
         dates = sorted(curated_assets_by_date)
-    threading.Thread(target=rescore_job, args=(snapshot_params(), dates), daemon=True).start()
+    _start_job({"type": "rescore", "params": snapshot_params(), "dates": dates})
     return redirect(url_for('top'))
 
 
@@ -2271,7 +2443,15 @@ if __name__ == "__main__":
         action="store_true",
         help="With --month: skip dates whose candidates are already in the album.",
     )
+    parser.add_argument(
+        "--run-job",
+        metavar="REQUEST_JSON",
+        help=argparse.SUPPRESS,  # internal: worker entry point used by the web UI
+    )
     args = parser.parse_args()
+
+    if args.run_job:
+        _run_job_child(args.run_job)  # never returns
 
     print("========================================")
     print(" Immich AI Album Curator ")
