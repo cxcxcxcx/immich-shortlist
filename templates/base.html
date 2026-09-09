@@ -9,10 +9,10 @@
 <body>
 <nav class="navbar">
     <div class="container navbar-inner">
-        <a class="brand" href="{{ url_for('index') }}"><span class="brand-dot"></span>Photo Curator</a>
+        <a class="brand" href="{{ url_for('index') }}"><span class="brand-dot"></span><span class="brand-name">Photo Curator</span></a>
         <div class="nav-links">
-            <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'home' }}">New run</a>
-            <a href="{{ url_for('top') }}" class="{{ 'active' if active_page == 'top' }}">Top picks</a>
+            <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'home' }}"><span class="nl-full">New run</span><span class="nl-short">Run</span></a>
+            <a href="{{ url_for('top') }}" class="{{ 'active' if active_page == 'top' }}"><span class="nl-full">Top picks</span><span class="nl-short">Top</span></a>
             <a href="{{ url_for('clusters') }}" class="{{ 'active' if active_page == 'clusters' }}">Clusters</a>
             <a href="{{ url_for('sync_page') }}" class="{{ 'active' if active_page == 'sync' }}">Sync</a>
             <a href="{{ url_for('settings') }}" class="{{ 'active' if active_page == 'settings' }}">Settings</a>
