@@ -12,3 +12,10 @@ SYNC_OUT_ROOT = Path(
     os.environ.get("SYNC_OUT_ROOT", "/media/NASRoot/homes/admin/.Qsync/kids_photos")
 )
 LOCAL_TZ_NAME = os.environ.get("LOCAL_TZ", "America/Los_Angeles")
+
+# Pixtale gallery (see upload_to_pixtale.py / sync_album_to_pixtale.py).
+# No password here: it is read from PIXTALE_PASSWORD or ~/pixtale/.env at use
+# time (config can't import upload_to_pixtale — that would be circular).
+PIXTALE_URL = os.environ.get("PIXTALE_URL", "http://localhost:8083")
+PIXTALE_USER = os.environ.get("PIXTALE_USER", "admin")
+PIXTALE_STORAGE_ID = os.environ.get("PIXTALE_STORAGE_ID", "")

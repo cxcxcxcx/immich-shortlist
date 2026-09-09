@@ -96,6 +96,15 @@ class State:
             tmp.replace(self.path)
 
 
+def default_storage_id(storages: list[dict]) -> str | None:
+    """Pick the first enabled object-storage (S3) backend; fall back to the first."""
+    # type 2 == object storage (S3); type 1 == local.
+    for opt in storages:
+        if opt.get("type") == 2:
+            return opt["storageId"]
+    return storages[0]["storageId"] if storages else None
+
+
 class PixtaleClient:
     def __init__(self, base_url: str, username: str, password: str, storage_id: str | None):
         self.base = base_url.rstrip("/")
@@ -118,17 +127,15 @@ class PixtaleClient:
         if not (data.get("data") or {}).get("token"):
             raise RuntimeError("login succeeded but no token returned")
 
+    def storages(self) -> list[dict]:
+        """Enabled storages as [{storageId, name, type}] (pixtale's own picker list)."""
+        return (self._post_json("/api/storage/select", {}).get("data") or [])
+
     def _detect_storage(self) -> str:
-        """Pick the first enabled object-storage (S3) backend; fall back to first."""
-        data = self._post_json("/api/storage/select", {})
-        options = data.get("data") or []
+        options = self.storages()
         if not options:
             raise RuntimeError("no storage configured in pixtale")
-        # type 2 == object storage (S3); type 1 == local.
-        for opt in options:
-            if opt.get("type") == 2:
-                return opt["storageId"]
-        return options[0]["storageId"]
+        return default_storage_id(options)
 
     def upload(self, f: Path) -> tuple[str, str]:
         """Upload one file. Returns (status, detail). status in {ok, duplicate, error}."""

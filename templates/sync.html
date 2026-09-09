@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Sync — Photo Curator{% endblock %}
+{% block container_class %}container-narrow{% endblock %}
+{% block content %}
+<div class="page-head">
+    <h1>Sync to Pixtale</h1>
+    <p>Makes the gallery mirror the album: adds missing photos, optionally deletes ones no longer in the album.</p>
+</div>
+
+{% if storage_error %}
+<div class="banner banner-warn">
+    <span>Couldn't reach Pixtale to list storages ({{ storage_error }}). You can still start a sync with
+        <strong>auto-detect</strong> (prefers the S3 backend), or <a href="{{ url_for('sync_page') }}">retry</a>.</span>
+</div>
+{% endif %}
+
+<div class="card card-pad" id="sync-form-card" {% if running %}style="display:none"{% endif %}>
+    <h2 class="section-title">Start a sync</h2>
+    <form id="sync-form" action="{{ url_for('sync_start') }}" method="POST">
+        <div class="form-group">
+            <label class="form-label" for="storage_id">Storage backend</label>
+            <select name="storage_id" id="storage_id" class="input">
+                <option value="">Auto-detect (prefer S3)</option>
+                {% for s in storages %}
+                <option value="{{ s.storageId }}" {% if s.storageId == default_storage_id %}selected{% endif %}>{{ s.name }} — {{ 'S3 / object storage' if s.type == 2 else 'local disk' }}</option>
+                {% endfor %}
+            </select>
+            <p class="form-hint">New photos are uploaded to the selected backend; photos already in the gallery stay where they are.</p>
+        </div>
+        <div class="form-group">
+            <label class="check-row">
+                <input type="checkbox" name="delete" value="1">
+                <span>Also delete Pixtale photos that are no longer in the album</span>
+            </label>
+            <p class="form-hint">Permanent: removes storage objects and gallery records. Videos are never touched.</p>
+        </div>
+        <div class="sync-actions">
+            <button type="submit" class="btn btn-primary">Start sync</button>
+            <button type="submit" name="dry_run" value="1" class="btn btn-ghost">Preview (dry run)</button>
+        </div>
+        <p class="form-hint" style="text-align:center">Safe to re-run — photos already in the gallery are reported as duplicates and skipped.</p>
+    </form>
+</div>
+
+<div id="sync-panel" class="card card-pad progress-card" style="display:{{ 'block' if running or snap.state != 'idle' else 'none' }}">
+    <div class="progress-head">
+        <span class="status-dot running" id="sync-dot"></span>
+        <h2 class="section-title" style="margin:0" id="sync-title">Sync</h2>
+    </div>
+    <p id="sync-plan" class="mini" style="margin:0.2rem 0 0.6rem"></p>
+    <div class="bar-track"><div id="sync-bar" class="bar-fill active"></div></div>
+    <p id="sync-text" class="progress-text"></p>
+    <p id="sync-detail" class="form-hint" style="margin:0"></p>
+    <div id="sync-failures" style="display:none">
+        <p class="form-label" style="margin-bottom:0.2rem">Failed uploads</p>
+        <ul id="sync-failure-list" class="fail-list"></ul>
+    </div>
+    <div id="sync-summary" class="sync-summary" style="display:none"></div>
+    <div class="sync-actions">
+        <button id="sync-cancel" type="button" class="btn btn-danger btn-sm">Stop this sync</button>
+        <button id="sync-again" type="button" class="btn btn-ghost btn-sm" style="display:none">Run another sync</button>
+    </div>
+</div>
+{% endblock %}
+{% block scripts %}<script src="{{ url_for('static', filename='sync.js') }}"></script>{% endblock %}

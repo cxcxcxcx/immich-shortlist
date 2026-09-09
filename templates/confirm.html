@@ -18,10 +18,18 @@
         <p>Check the server console for the error, then try again.</p>
         {% endif %}
         <div class="confirm-actions">
+            {% if status == 'ok' %}
+            <form action="{{ url_for('sync_start') }}" method="POST" style="display:contents">
+                <input type="hidden" name="storage_id" value="">
+                <button type="submit" class="btn btn-primary">Sync to Pixtale</button>
+            </form>
+            {% else %}
             <a class="btn btn-primary" href="{{ url_for('top') }}">Top picks</a>
+            {% endif %}
             <a class="btn btn-ghost" href="{{ url_for('clusters') }}">Clusters</a>
             <a class="btn btn-ghost" href="{{ url_for('index') }}">New run</a>
         </div>
+        {% if status == 'ok' %}<p class="mini">"Sync to Pixtale" publishes the album to the gallery with defaults (auto-detected S3 storage, no deletes) — <a href="{{ url_for('sync_page') }}">more options</a>.</p>{% endif %}
     </div>
 </div>
 {% endblock %}

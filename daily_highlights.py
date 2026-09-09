@@ -38,6 +38,9 @@ from flask import Flask, render_template, request, redirect, url_for, jsonify
 # CONFIGURATION
 # ==========================================
 from config import IMMICH_URL, API_KEY, ALBUM_ID, LOCAL_TZ_NAME
+from config import PIXTALE_URL, PIXTALE_USER, PIXTALE_STORAGE_ID
+from sync_album_to_pixtale import run_sync, SYNC_CONCURRENCY
+from upload_to_pixtale import PixtaleClient, _read_default_password, default_storage_id
 
 # Local timezone used to interpret date boundaries (inclusive days).
 LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
@@ -335,6 +338,35 @@ CURATION_STATE = {
 }
 # Set by /cancel; the job checks it between days.
 CURATION_CANCEL = threading.Event()
+# Live progress of an album -> pixtale sync (sync_album_to_pixtale.run_sync).
+# Deliberately independent of CURATION_STATE: a sync is cheap and network-bound,
+# so it may legitimately run alongside a curation or re-score.
+SYNC_LOCK = threading.Lock()
+SYNC_STATE = {
+    "state": "idle",  # idle | running | done | cancelled | error
+    "phase": "",  # fetching_album | fetching_pixtale | planned | deleting | adding
+    "dry_run": False,
+    "delete": False,
+    "storage_id": "",
+    "plan_add": 0,
+    "plan_delete": 0,
+    "add_done": 0,
+    "add_total": 0,
+    "deleted": 0,
+    "counters": {"ok": 0, "duplicate": 0, "error": 0},
+    "samples_add": [],  # <=5 {"id","taken"}
+    "samples_delete": [],  # <=5 [stem, photoId]
+    "failures": [],  # <=20 [asset_id, detail]
+    "current_asset": "",
+    "started_at": None,
+    "finished_at": None,
+    "error": "",
+}
+# Set by /sync/cancel; run_sync checks it between phases/batches/uploads.
+SYNC_CANCEL = threading.Event()
+# Pixtale storage list for the /sync dropdown, TTL-cached like _people_cache.
+_pixtale_storage_cache: dict | None = None  # {"fetched_at": float, "storages": [...]}
+_pixtale_storage_lock = threading.Lock()
 # On-disk checkpoint of curation results, so restarts don't lose them.
 CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_checkpoint.json")
 _checkpoint_info: dict | None = None
@@ -1518,6 +1550,120 @@ def rescore_job(params, dates=None):
         CURATION_STATE["finished_at"] = time.time()
 
 
+# ==========================================
+# PIXTALE SYNC (album -> gallery, see sync_album_to_pixtale.py)
+# ==========================================
+def _pixtale_password() -> str:
+    """PIXTALE_PASSWORD env, else the admin password from ~/pixtale/.env."""
+    return os.environ.get("PIXTALE_PASSWORD") or (_read_default_password() or "")
+
+
+def fetch_pixtale_storages(ttl_sec: float = 300.0) -> list[dict]:
+    """Pixtale's enabled storages [{storageId, name, type}]; TTL-cached; raises on failure."""
+    global _pixtale_storage_cache
+    with _pixtale_storage_lock:
+        cached = _pixtale_storage_cache
+        if cached and time.time() - cached["fetched_at"] < ttl_sec:
+            return cached["storages"]
+    password = _pixtale_password()
+    if not password:
+        raise RuntimeError("No pixtale password (set PIXTALE_PASSWORD or populate ~/pixtale/.env)")
+    client = PixtaleClient(PIXTALE_URL, PIXTALE_USER, password, storage_id=None)
+    storages = client.storages()
+    with _pixtale_storage_lock:
+        _pixtale_storage_cache = {"fetched_at": time.time(), "storages": storages}
+    return storages
+
+
+def _safe_pixtale_storages() -> tuple[list[dict], str]:
+    """fetch_pixtale_storages that degrades to ([], reason) when pixtale is unreachable."""
+    try:
+        return fetch_pixtale_storages(), ""
+    except Exception as exc:
+        print(f"Could not list pixtale storages: {exc}")
+        return [], f"{type(exc).__name__}: {exc}"
+
+
+def sync_job(storage_id: str, delete: bool, dry_run: bool) -> None:
+    """Background album -> pixtale reconcile; mirrors the curation state machine."""
+    SYNC_CANCEL.clear()
+    with SYNC_LOCK:
+        SYNC_STATE.update(
+            state="running", phase="fetching_album", dry_run=dry_run, delete=delete,
+            storage_id=storage_id or "(auto-detect)",
+            plan_add=0, plan_delete=0, add_done=0, add_total=0, deleted=0,
+            counters={"ok": 0, "duplicate": 0, "error": 0},
+            samples_add=[], samples_delete=[], failures=[], current_asset="",
+            started_at=time.time(), finished_at=None, error="",
+        )
+
+    def on_event(ev: dict) -> None:
+        with SYNC_LOCK:
+            SYNC_STATE["phase"] = ev.get("phase", SYNC_STATE["phase"])
+            for key in ("plan_add", "plan_delete", "add_done", "add_total", "deleted"):
+                if key in ev:
+                    SYNC_STATE[key] = ev[key]
+            if ev.get("storage_id"):
+                SYNC_STATE["storage_id"] = ev["storage_id"]
+            if "counters" in ev:
+                SYNC_STATE["counters"] = dict(ev["counters"])
+            if "samples_add" in ev:
+                SYNC_STATE["samples_add"] = ev["samples_add"][:5]
+            if "samples_delete" in ev:
+                SYNC_STATE["samples_delete"] = ev["samples_delete"][:5]
+            if "last_asset" in ev:
+                SYNC_STATE["current_asset"] = ev["last_asset"]
+            if ev.get("last_status") == "error" and len(SYNC_STATE["failures"]) < 20:
+                SYNC_STATE["failures"].append([ev.get("last_asset", ""), ev.get("last_detail", "")])
+
+    try:
+        summary = run_sync(
+            IMMICH_URL, API_KEY, ALBUM_ID, PIXTALE_URL, PIXTALE_USER, _pixtale_password(),
+            storage_id or None,  # "" -> PixtaleClient auto-detects (prefers the S3 backend)
+            delete=delete, dry_run=dry_run, concurrency=SYNC_CONCURRENCY,
+            progress=on_event, cancelled=SYNC_CANCEL.is_set,
+        )
+        with SYNC_LOCK:
+            SYNC_STATE.update(
+                counters=dict(summary["counters"]),
+                failures=list(summary["failures"]),
+                samples_add=summary["samples_add"][:5],
+                samples_delete=summary["samples_delete"][:5],
+                plan_add=summary["plan_add"], plan_delete=summary["plan_delete"],
+                add_done=summary["add_done"], add_total=summary["add_total"],
+                deleted=summary["deleted"],
+                storage_id=summary.get("storage_id") or SYNC_STATE["storage_id"],
+                state="cancelled" if summary["cancelled"] else "done",
+                finished_at=time.time(),
+            )
+    except BaseException as e:
+        with SYNC_LOCK:
+            SYNC_STATE["state"] = "error"
+            SYNC_STATE["error"] = f"{type(e).__name__}: {e}"
+            SYNC_STATE["finished_at"] = time.time()
+        raise
+
+
+def _sync_snapshot() -> dict:
+    with SYNC_LOCK:
+        snap = dict(SYNC_STATE)
+        snap["counters"] = dict(SYNC_STATE["counters"])
+        snap["failures"] = list(SYNC_STATE["failures"])
+        snap["samples_add"] = list(SYNC_STATE["samples_add"])
+        snap["samples_delete"] = list(SYNC_STATE["samples_delete"])
+    if snap["started_at"]:
+        snap["elapsed_sec"] = int((snap["finished_at"] or time.time()) - snap["started_at"])
+    if snap["phase"] == "deleting":
+        total, done = snap["plan_delete"], snap["deleted"]
+    else:
+        total, done = snap["add_total"], snap["add_done"]
+    if total:
+        snap["pct"] = int(round(100 * done / total))
+    else:
+        snap["pct"] = 100 if snap["state"] != "running" else 0
+    return snap
+
+
 def build_score_line(asset: dict) -> str:
     """
     Build a short HTML snippet describing base score and boosts
@@ -1626,6 +1772,55 @@ def rescore():
         dates = sorted(curated_assets_by_date)
     threading.Thread(target=rescore_job, args=(snapshot_params(), dates), daemon=True).start()
     return redirect(url_for('top'))
+
+
+@app.route('/sync')
+def sync_page():
+    """Storage picker + live progress for the album -> pixtale reconcile."""
+    storages, storage_error = _safe_pixtale_storages()
+    default_id = default_storage_id(storages) or PIXTALE_STORAGE_ID or ""
+    with SYNC_LOCK:
+        running = SYNC_STATE["state"] == "running"
+    return render_template(
+        "sync.html",
+        storages=storages,
+        storage_error=storage_error,
+        default_storage_id=default_id,
+        snap=_sync_snapshot(),
+        running=running,
+        active_page="sync",
+    )
+
+
+@app.route('/sync/start', methods=['POST'])
+def sync_start():
+    """Start a background album -> pixtale sync (single-flight within sync only)."""
+    with SYNC_LOCK:
+        if SYNC_STATE["state"] == "running":
+            return "A pixtale sync is already running — watch it on the sync page.", 409
+    storage_id = (request.form.get("storage_id") or "").strip()
+    delete = bool(request.form.get("delete"))
+    dry_run = bool(request.form.get("dry_run"))  # set by the "Preview" submit button
+    if not _pixtale_password():
+        return "Missing pixtale password: set PIXTALE_PASSWORD or populate ~/pixtale/.env", 409
+    threading.Thread(target=sync_job, args=(storage_id, delete, dry_run), daemon=True).start()
+    return redirect(url_for('sync_page'))
+
+
+@app.route('/sync/status')
+def sync_status():
+    """JSON snapshot of the sync run; polled by the sync page."""
+    return jsonify(_sync_snapshot())
+
+
+@app.route('/sync/cancel', methods=['POST'])
+def sync_cancel():
+    """Ask the running sync to stop; in-flight uploads finish and are counted."""
+    SYNC_CANCEL.set()
+    with SYNC_LOCK:
+        was_running = SYNC_STATE["state"] == "running"
+    return jsonify({"ok": was_running})
+
 
 @app.route('/top')
 def top():
