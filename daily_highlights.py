@@ -12,7 +12,10 @@ confirmation before adding them to an album.
 import argparse
 import calendar
 import copy
+import ctypes
+import gc
 import os
+import sys
 import io
 import json
 import re
@@ -24,12 +27,11 @@ import threading
 from zoneinfo import ZoneInfo
 from PIL import Image
 
-# ML / evaluation
-import torch
+# ML / evaluation. torch / transformers / pyiqa / mediapipe are imported lazily
+# inside the functions that use them: importing all four costs ~1.3 GB of RSS
+# (mediapipe alone drags in TensorFlow), which the gallery/sync UI never needs
+# until a curation or re-score actually runs. numpy/PIL stay top-level (cheap).
 import numpy as np
-import mediapipe as mp
-from transformers import CLIPModel, CLIPProcessor
-import pyiqa
 
 # Web UI
 from flask import Flask, render_template, request, redirect, url_for, jsonify
@@ -607,6 +609,7 @@ def get_album_asset_ids(album_id):
 
 def _pil_to_tensor_01(pil_img):
     """PIL Image (RGB) -> tensor (1, 3, H, W) in [0, 1] for PyIQA."""
+    import torch
     arr = np.array(pil_img, dtype=np.float32) / 255.0
     arr = arr.transpose(2, 0, 1)  # HWC -> CHW
     return torch.from_numpy(arr).unsqueeze(0)
@@ -833,6 +836,8 @@ def _detect_face_rows(img, asset):
     The rows are cacheable, so aggregate_expression() can re-score under any
     params or face sets without re-running MediaPipe.
     """
+    import mediapipe as mp
+
     landmarker = _get_face_landmarker()
 
     img_rgb = np.array(img.convert("RGB"))
@@ -996,6 +1001,8 @@ def debug_crops(asset_id):
     Debug page: show all Immich face crops for a given asset so cropping
     can be visually validated.
     """
+    import mediapipe as mp
+
     img = download_thumbnail(asset_id)
     if img is None:
         return f"<h3>No thumbnail available for asset {asset_id}</h3>", 404
@@ -1190,6 +1197,8 @@ def combine_and_cluster(assets, quality_scores, expression_scores, clip_feats, p
 def _compute_asset_features(asset, device, clip_model, clip_processor, params):
     """ML feature path for one asset: MUSIQ quality + face rows + CLIP embedding.
     Returns (raw_q, face_payload, feats), or None when no thumbnail is available."""
+    import torch
+
     asset_id = asset.get("id")
     img = download_thumbnail(asset_id)
     if img is None:
@@ -1220,6 +1229,8 @@ def evaluate_and_cluster(assets, device, clip_model, clip_processor, params):
     the features to combine_and_cluster for scoring. `params` is the job's
     settings snapshot. Returns the scored, clustered, sorted assets.
     """
+    import pyiqa
+
     if not assets:
         return []
     print(f"  -> Processing {len(assets)} assets...")
@@ -1302,6 +1313,9 @@ def load_models():
     global _models_cache
     if _models_cache is not None:
         return _models_cache
+    import torch
+    from transformers import CLIPModel, CLIPProcessor
+
     print("Loading CLIP embedding model (this may take a moment)...")
     device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32").to(device)
@@ -1350,6 +1364,19 @@ def recompute_default_selection(params=None):
                 if "id" in a:
                     selected.add(a["id"])
     selected_asset_ids = selected
+
+
+def release_memory() -> None:
+    """
+    Hand freed heap back to the OS after a big job. CPython frees the objects,
+    but glibc keeps the arenas, so RSS sits at the job's high-water mark (gigs)
+    until something reuses them. gc first so cycles don't pin arenas.
+    """
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception as e:
+        print(f"malloc_trim unavailable, skipping: {e}")
 
 
 def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_album=False, params=None):
@@ -1424,10 +1451,12 @@ def run_curation_for_date_range(start_date, end_date, skip_dates_already_in_albu
             CURATION_STATE["state"] = "error"
             CURATION_STATE["error"] = f"{type(e).__name__}: {e}"
             CURATION_STATE["finished_at"] = time.time()
+        release_memory()
         raise
     with CURATION_LOCK:
         CURATION_STATE["state"] = "cancelled" if CURATION_CANCEL.is_set() else "done"
         CURATION_STATE["finished_at"] = time.time()
+    release_memory()
 
 
 def rescore_date(assets, params):
@@ -1438,6 +1467,8 @@ def rescore_date(assets, params):
     missing from the cache entirely go through the full feature path.
     Returns (scored, backfilled).
     """
+    import pyiqa
+
     global _musiq_metric
     scored = backfilled = 0
     valid: list[dict] = []
@@ -1544,10 +1575,12 @@ def rescore_job(params, dates=None):
             CURATION_STATE["state"] = "error"
             CURATION_STATE["error"] = f"{type(e).__name__}: {e}"
             CURATION_STATE["finished_at"] = time.time()
+        release_memory()
         raise
     with CURATION_LOCK:
         CURATION_STATE["state"] = "cancelled" if CURATION_CANCEL.is_set() else "done"
         CURATION_STATE["finished_at"] = time.time()
+    release_memory()
 
 
 # ==========================================
@@ -1820,6 +1853,74 @@ def sync_cancel():
     with SYNC_LOCK:
         was_running = SYNC_STATE["state"] == "running"
     return jsonify({"ok": was_running})
+
+
+def _rss_kb() -> dict:
+    """Current + peak RSS in KB from /proc (Linux)."""
+    out = {}
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith(("VmRSS:", "VmHWM:")):
+                    key, kb, _ = line.split()
+                    out[key.rstrip(':').lower()] = int(kb)
+    except OSError:
+        pass
+    return out
+
+
+@app.route('/debug/mem')
+def debug_mem():
+    """Memory diagnostics: process RSS, model footprint, per-cache sizes. Read-only."""
+    def deep_size(o, _seen=None) -> int:
+        if _seen is None:
+            _seen = set()
+        if id(o) in _seen:
+            return 0
+        _seen.add(id(o))
+        total = sys.getsizeof(o)
+        if isinstance(o, dict):
+            for k, v in o.items():
+                total += deep_size(k, _seen) + deep_size(v, _seen)
+        elif isinstance(o, (list, tuple, set, frozenset)):
+            for v in o:
+                total += deep_size(v, _seen)
+        return total
+
+    with _thumb_lock:
+        thumbs_bytes = sum(len(b) for b, _mime in _thumb_cache.values())
+    person_thumbs_bytes = sum(len(b) for b, _mime in _person_thumb_cache.values())
+    with _feature_lock:
+        feature = {"entries": len(_feature_cache), "bytes": deep_size(_feature_cache)}
+
+    models = {"clip_loaded": _models_cache is not None, "musiq_loaded": _musiq_metric is not None,
+              "face_landmarker_loaded": _face_landmarker is not None}
+    if _models_cache is not None:
+        clip = _models_cache[1]
+        models["clip_params_mb"] = round(sum(p.numel() * p.element_size() for p in clip.parameters()) / 2**20, 1)
+    if _musiq_metric is not None:
+        try:
+            models["musiq_params_mb"] = round(
+                sum(p.numel() * p.element_size() for p in _musiq_metric.model.parameters()) / 2**20, 1)
+        except AttributeError:
+            pass
+
+    return jsonify({
+        "rss": _rss_kb(),
+        "gc": {"counts": gc.get_count(),
+               "collected_total": sum(s["collected"] for s in gc.get_stats())},
+        "models": models,
+        "caches": {
+            "thumbs": {"entries": len(_thumb_cache), "bytes": thumbs_bytes},
+            "person_thumbs": {"entries": len(_person_thumb_cache), "bytes": person_thumbs_bytes},
+            "faces": {"entries": len(_faces_cache)},
+            "feature_cache": feature,
+            "curated_days": len(curated_assets_by_date),
+            "curated_assets": sum(len(v) for v in curated_assets_by_date.values()),
+            "selected_ids": len(selected_asset_ids),
+        },
+        "jobs": {"curation": CURATION_STATE["state"], "sync": SYNC_STATE["state"]},
+    })
 
 
 @app.route('/top')
@@ -2202,4 +2303,7 @@ if __name__ == "__main__":
             exit(1)
         exit(0)
 
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=True, use_reloader=True)
+    # FLASK_RELOADER=0 runs a single process: the reloader's supervisor process
+    # otherwise keeps a full second copy of the imports alive (~0.65 GB idle).
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=True,
+            use_reloader=os.environ.get("FLASK_RELOADER", "1") != "0")
