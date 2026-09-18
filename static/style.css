@@ -527,6 +527,99 @@ main.container { padding-top: 1.5rem; padding-bottom: 6rem; }
 .people-tile:hover { border-color: var(--border-strong); }
 .people-tile:has(input:checked) { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent-ring); }
 
+/* ---------- Lightbox ---------- */
+.zoom-btn {
+  position: absolute;
+  right: 0.45rem;
+  bottom: 2.6rem;
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border: none;
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.55);
+  -webkit-backdrop-filter: blur(4px);
+  backdrop-filter: blur(4px);
+  color: #fff;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background 0.15s, transform 0.15s;
+}
+.zoom-btn:hover { background: var(--accent); transform: scale(1.08); }
+.lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 6, 23, 0.92);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+}
+.lightbox.open { display: flex; }
+.lightbox figure {
+  margin: 0;
+  max-width: 94vw;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.5rem;
+}
+.lightbox img {
+  max-width: 94vw;
+  max-height: 86vh;
+  object-fit: contain;
+  border-radius: var(--radius);
+  background: var(--surface-2) center/cover no-repeat;
+  box-shadow: var(--shadow-lg);
+}
+.lightbox figcaption {
+  color: #cbd5e1;
+  font-size: 0.85rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.lb-close {
+  position: absolute;
+  top: 0.9rem;
+  right: 1rem;
+  width: 40px;
+  height: 40px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 1.05rem;
+  cursor: pointer;
+}
+.lb-close:hover { background: rgba(255, 255, 255, 0.24); }
+.lb-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 1.9rem;
+  line-height: 1;
+  cursor: pointer;
+  padding-bottom: 0.3rem;
+}
+.lb-nav:hover { background: rgba(255, 255, 255, 0.24); }
+.lb-prev { left: 1rem; }
+.lb-next { right: 1rem; }
+body.lb-lock { overflow: hidden; }
+@media (max-width: 640px) {
+  .lb-nav { width: 40px; height: 40px; font-size: 1.5rem; }
+  .zoom-btn { bottom: 2.2rem; }
+}
+
 /* ---------- Small screens ---------- */
 @media (max-width: 640px) {
   .form-grid { grid-template-columns: 1fr; }

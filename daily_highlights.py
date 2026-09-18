@@ -1628,6 +1628,7 @@ def sync_job(storage_id: str, delete: bool, dry_run: bool) -> None:
             plan_add=0, plan_delete=0, add_done=0, add_total=0, deleted=0,
             counters={"ok": 0, "duplicate": 0, "error": 0},
             samples_add=[], samples_delete=[], failures=[], current_asset="",
+            albums={}, albums_error="",
             started_at=time.time(), finished_at=None, error="",
         )
 
@@ -1666,6 +1667,8 @@ def sync_job(storage_id: str, delete: bool, dry_run: bool) -> None:
                 plan_add=summary["plan_add"], plan_delete=summary["plan_delete"],
                 add_done=summary["add_done"], add_total=summary["add_total"],
                 deleted=summary["deleted"],
+                albums=summary.get("albums") or {},
+                albums_error=summary.get("albums_error", ""),
                 storage_id=summary.get("storage_id") or SYNC_STATE["storage_id"],
                 state="cancelled" if summary["cancelled"] else "done",
                 finished_at=time.time(),
@@ -2250,6 +2253,23 @@ def serve_thumbnail(asset_id):
             if len(_thumb_cache) >= 2000:
                 _thumb_cache.clear()
             _thumb_cache[asset_id] = (resp.content, ctype)
+    return resp.content, resp.status_code, _thumb_headers(ctype)
+
+
+@app.route('/preview/<asset_id>')
+def serve_preview(asset_id):
+    """
+    Proxy for the large (1440px) Immich preview used by the lightbox. Too big to
+    hold in memory per asset, so this streams through — the browser caches it
+    (immutable per asset id) so repeated opens don't re-fetch.
+    """
+    if not _UUID_RE.match(asset_id):
+        return "Not found", 404
+    resp = requests.get(
+        f"{IMMICH_URL}/api/assets/{asset_id}/thumbnail?size=preview",
+        headers={"x-api-key": API_KEY}, timeout=60,
+    )
+    ctype = resp.headers.get('Content-Type', 'image/jpeg')
     return resp.content, resp.status_code, _thumb_headers(ctype)
 
 

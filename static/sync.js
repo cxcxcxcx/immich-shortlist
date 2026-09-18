@@ -44,6 +44,7 @@
         fetching_album: 'Listing album assets from Immich…',
         fetching_pixtale: 'Listing the current gallery…',
         planned: 'Plan ready',
+        albums: 'Updating source albums…',
         deleting: 'Deleting',
         adding: 'Uploading',
     };
@@ -61,9 +62,19 @@
 
     function showSummary(s) {
         const c = s.counters || {};
-        summaryEl.textContent = (s.dry_run ? 'Preview — nothing was changed. ' : '') +
+        let text = (s.dry_run ? 'Preview — nothing was changed. ' : '') +
             'added ' + (c.ok || 0) + ' · duplicates ' + (c.duplicate || 0) +
             ' · failed ' + (c.error || 0) + ' · deleted ' + (s.deleted || 0);
+        const albums = s.albums || {};
+        const parts = Object.keys(albums).map((name) => {
+            const st = albums[name] || {};
+            let bit = name + ' ' + (st.total || 0);
+            if (st.add || st.remove) bit += ' (+' + (st.add || 0) + ' -' + (st.remove || 0) + ')';
+            return bit;
+        });
+        if (parts.length) text += ' · albums: ' + parts.join(', ');
+        if (s.albums_error) text += ' · albums failed: ' + s.albums_error;
+        summaryEl.textContent = text;
         summaryEl.style.display = 'block';
         renderFailures(s.failures);
     }

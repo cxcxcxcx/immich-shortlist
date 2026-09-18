@@ -55,7 +55,7 @@ GREEN, RED, YELLOW, DIM, RESET = _c("\033[32m"), _c("\033[31m"), _c("\033[33m"),
 
 def _read_default_password() -> str | None:
     """Read the admin password from the pixtale compose .env if present."""
-    env_file = Path.home() / "pixtale" / ".env"
+    env_file = Path(__file__).resolve().parent / "pixtale" / ".env"
     if not env_file.is_file():
         return None
     for line in env_file.read_text().splitlines():

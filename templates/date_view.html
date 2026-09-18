@@ -26,4 +26,7 @@
     </div>
 </form>
 {% endblock %}
-{% block scripts %}<script src="{{ url_for('static', filename='gallery.js') }}"></script>{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='gallery.js') }}"></script>
+<script src="{{ url_for('static', filename='lightbox.js') }}"></script>
+{% endblock %}

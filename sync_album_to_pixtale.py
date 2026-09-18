@@ -35,8 +35,10 @@ PIXTALE_URL, PIXTALE_USER, PIXTALE_PASSWORD, PIXTALE_STORAGE_ID.
 from __future__ import annotations
 
 import argparse
+import json
 import mimetypes
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -57,6 +59,126 @@ from upload_to_pixtale import PixtaleClient, _read_default_password
 
 DELETE_BATCH = 50
 LIST_PAGE_SIZE = 500
+
+# Source albums: after every sync every photo is placed into exactly one of
+# these albums based on its EXIF camera model, so viewers can browse by
+# capture device. Order matters only for display.
+SOURCE_ALBUM_NAMES = ("相机", "幼儿园", "手机", "其它")
+ALBUM_OP_BATCH = 500
+
+
+def classify_source(exif: dict | None) -> str:
+    """Bucket a photo into one of SOURCE_ALBUM_NAMES by its EXIF make/model.
+
+    相机 = real cameras (Canon), 幼儿园 = the old iPhone 12/14 era, 手机 =
+    recent iPhones (15+) plus Pixel/Galaxy, everything else (Ray-Ban glasses,
+    drones, iPads, unknown models, intermediate iPhones) -> 其它.
+    """
+    exif = exif or {}
+    model = str(exif.get("Model") or "")
+    make = str(exif.get("Make") or "")
+    if "canon" in f"{make} {model}".lower():
+        return "相机"
+    if model.startswith("iPhone 12") or model.startswith("iPhone 14"):
+        return "幼儿园"
+    match = re.match(r"iPhone (\d+)", model)
+    if (match and int(match.group(1)) >= 15) or "Galaxy" in model or "Pixel" in model:
+        return "手机"
+    return "其它"
+
+
+def _list_all_rows(client: PixtaleClient, album_id: str | None = None) -> list[dict]:
+    """All /photo/list rows (photoId, name, exif, ...) in one raw query when the
+    server returns them, falling back to the cursor walk for big libraries."""
+    payload: dict = {"size": 100000}
+    if album_id:
+        payload["albumId"] = album_id
+    r = client.session.post(f"{client.base}/api/photo/list", json=payload, timeout=120)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("code") != 200:
+        raise RuntimeError(f"/api/photo/list -> {body.get('message') or body}")
+    data = body.get("data") or {}
+    rows = data.get("list") or []
+    if len(rows) >= (data.get("total") or 0):
+        return rows
+    # Server truncated the raw query: continue with cursor pagination.
+    cursor_time, cursor_pid = str(rows[-1].get("takenTime")), str(rows[-1].get("photoId"))
+    while rows and len(rows) < (data.get("total") or 0):
+        page_payload = {"size": LIST_PAGE_SIZE, "cursorTime": cursor_time, "cursorPhotoId": cursor_pid}
+        if album_id:
+            page_payload["albumId"] = album_id
+        r = client.session.post(f"{client.base}/api/photo/list", json=page_payload, timeout=60)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("code") != 200:
+            raise RuntimeError(f"/api/photo/list -> {body.get('message') or body}")
+        page = (body.get("data") or {}).get("list") or []
+        if not page:
+            break
+        rows.extend(page)
+        cursor_time, cursor_pid = str(page[-1].get("takenTime")), str(page[-1].get("photoId"))
+    return rows
+
+
+def _album_op(client: PixtaleClient, path: str, body: dict) -> None:
+    r = client.session.post(f"{client.base}/api/album/{path}", json=body, timeout=60)
+    payload = r.json()
+    if r.status_code != 200 or payload.get("code") != 200:
+        raise RuntimeError(f"/api/album/{path} -> {payload.get('message') or payload}")
+
+
+def maintain_source_albums(client: PixtaleClient, apply: bool = True) -> dict:
+    """
+    Reconcile the four source albums against EXIF classification.
+
+    With apply=False this only computes the plan (used by --dry-run). Writes are
+    idempotent: missing albums are created, photos are added to / removed from
+    albums in diffs, so every photo ends up in exactly one album.
+    """
+    desired: dict[str, list[str]] = {name: [] for name in SOURCE_ALBUM_NAMES}
+    for row in _list_all_rows(client):
+        try:
+            exif = json.loads(row.get("exif") or "{}")
+            if not isinstance(exif, dict):
+                exif = {}
+        except ValueError:
+            exif = {}
+        photo_id = str(row.get("photoId") or "")
+        if photo_id:
+            desired[classify_source(exif)].append(photo_id)
+
+    albums = client.session.post(f"{client.base}/api/album/list", json={}, timeout=30).json()
+    if albums.get("code") != 200:
+        raise RuntimeError(f"/api/album/list -> {albums.get('message') or albums}")
+    by_name = {a["name"]: a["albumId"] for a in albums.get("data") or [] if a.get("name")}
+    plan: dict[str, dict] = {}
+    for name in SOURCE_ALBUM_NAMES:
+        album_id = by_name.get(name)
+        if apply and album_id is None:
+            _album_op(client, "add", {"name": name, "description": ""})
+            albums = client.session.post(f"{client.base}/api/album/list", json={}, timeout=30).json()
+            by_name = {a["name"]: a["albumId"] for a in albums.get("data") or [] if a.get("name")}
+            album_id = by_name.get(name)
+        current: list[str] = []
+        if album_id:
+            current = [str(row.get("photoId")) for row in _list_all_rows(client, album_id=album_id)]
+        want = set(desired[name])
+        to_add = [pid for pid in desired[name] if pid not in set(current)]
+        to_remove = [pid for pid in current if pid not in want]
+        plan[name] = {
+            "album_id": album_id or "",
+            "total": len(desired[name]),
+            "add": len(to_add),
+            "remove": len(to_remove),
+        }
+        if not apply:
+            continue
+        for i in range(0, len(to_add), ALBUM_OP_BATCH):
+            _album_op(client, "addPhoto", {"albumIds": [album_id], "photoIds": to_add[i : i + ALBUM_OP_BATCH]})
+        for i in range(0, len(to_remove), ALBUM_OP_BATCH):
+            _album_op(client, "removePhoto", {"albumId": album_id, "photoIds": to_remove[i : i + ALBUM_OP_BATCH]})
+    return plan
 SYNC_CONCURRENCY = 4
 
 
@@ -170,9 +292,12 @@ def run_sync(
     ``progress`` receives flat phase events (``phase`` key), in order:
       fetching_album | fetching_pixtale (album/image counts, resolved storage_id)
       | planned (plan_add, plan_delete, samples_add/samples_delete <=20, flags)
+      | albums (plan-only when dry_run, else applied after the adds)
       | deleting (per DELETE_BATCH: deleted, plan_delete)
       | adding (phase start with add_total, then one event per completed asset:
         add_done, add_total, last_status, last_asset, last_detail, counters, rate)
+    The summary carries ``albums`` ({name: {total, add, remove}}) or
+    ``albums_error``; source-album upkeep never fails the sync.
     Events are emitted from the calling thread only, and a raising callback is
     swallowed (a UI must never kill a sync).
 
@@ -263,6 +388,13 @@ def run_sync(
     })
 
     if dry_run:
+        # Plan the source-album placement too, read-only.
+        emit({"phase": "albums"})
+        try:
+            result["albums"] = maintain_source_albums(client, apply=False)
+        except Exception as e:
+            result["albums_error"] = f"{type(e).__name__}: {e}"
+            print(f"source album planning failed: {e}", file=sys.stderr)
         return summary()
     if stop():
         result["cancelled"] = True
@@ -323,6 +455,17 @@ def run_sync(
                 refill()
 
     result["add_done"] = done
+
+    # Source albums run last so freshly added photos are classified too.
+    if not stop():
+        emit({"phase": "albums"})
+        try:
+            result["albums"] = maintain_source_albums(client, apply=True)
+        except Exception as e:
+            # Album upkeep must never kill the sync itself.
+            result["albums_error"] = f"{type(e).__name__}: {e}"
+            print(f"source album maintenance failed: {e}", file=sys.stderr)
+
     result["cancelled"] = stop()
     return summary()
 
@@ -343,7 +486,7 @@ def main() -> None:
     args = ap.parse_args()
 
     if not args.password:
-        raise SystemExit("Missing password: pass --password, set PIXTALE_PASSWORD, or populate ~/pixtale/.env")
+        raise SystemExit("Missing password: pass --password, set PIXTALE_PASSWORD, or populate pixtale/.env in this repo")
 
     # CLI formatter: turns run_sync's phase events into the traditional stderr lines.
     shown = {"deleting_header": False, "adding_header": False}
@@ -383,6 +526,8 @@ def main() -> None:
             elif ev["add_done"] and (ev["add_done"] % 25 == 0 or ev["last_status"] == "error"):
                 print(f"[{ev['add_done']}/{ev['add_total']}] {ev['last_status']} {ev['last_asset']}"
                       f" {str(ev['last_detail'])[:60]} ({ev['rate']:.1f}/s)", file=sys.stderr)
+        elif phase == "albums":
+            print("Updating source albums (相机/幼儿园/手机/其它)...", file=sys.stderr)
 
     summary = run_sync(
         args.immich_url, args.api_key, args.album_id, args.base_url,
@@ -390,6 +535,20 @@ def main() -> None:
         delete=args.delete, dry_run=args.dry_run, limit=args.limit,
         concurrency=args.concurrency, progress=_show,
     )
+    albums = summary.get("albums") or {}
+    if albums:
+        parts = []
+        for name, stats in albums.items():
+            if not isinstance(stats, dict) or "error" in stats:
+                continue
+            part = f"{name} {stats.get('total', 0)}"
+            if stats.get("add") or stats.get("remove"):
+                part += f" (+{stats.get('add', 0)} -{stats.get('remove', 0)})"
+            parts.append(part)
+        print("Source albums: " + ", ".join(parts), file=sys.stderr)
+    if summary.get("albums_error"):
+        print(f"Source album maintenance failed: {summary['albums_error']}", file=sys.stderr)
+
     if args.dry_run:
         print("\nDry run: nothing touched.", file=sys.stderr)
         return
