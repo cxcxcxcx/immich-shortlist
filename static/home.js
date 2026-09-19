@@ -18,6 +18,7 @@
     let end = null;     // Date | null
     let hoverDate = null;
     let view = { y: today.getFullYear(), m: today.getMonth() };
+    let albumCounts = {};   // {"YYYY-MM-DD": photos already in the album}
 
     function startOfDay(d) { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
     function iso(d) {
@@ -61,6 +62,7 @@
         const cls = ['cal-day'];
         if (d < first || d > last) cls.push('is-outside');
         if (sameDay(d, today)) cls.push('is-today');
+        if (albumCounts[iso(d)]) cls.push('has-photos');
         const re = rangeEnd();
         if (start && re) {
             const lo = start < re ? start : re;
@@ -78,8 +80,11 @@
         for (const d of DOW) html += '<div class="cal-dow">' + d + '</div>';
         for (let i = 0; i < 42; i++) {
             const d = addDays(gridStart, i);
+            const n = albumCounts[iso(d)] || 0;
+            const badge = n ? '<i class="cal-count">' + (n > 99 ? '99+' : n) + '</i>' : '';
             html += '<button type="button" class="' + cellClass(d, first, monthEnd(y, m)) +
-                '" data-iso="' + iso(d) + '">' + d.getDate() + '</button>';
+                '" data-iso="' + iso(d) + '" title="' + (n ? n + ' photos in album' : '') + '">' +
+                d.getDate() + badge + '</button>';
         }
         return html + '</div></div>';
     }
@@ -213,6 +218,12 @@
             setTimeout(poll, 4000);
         }
     }
+
+    // Album photo counts arrive async: re-render the calendar once they load.
+    fetch('/api/album_counts').then((r) => r.json()).then((d) => {
+        albumCounts = (d && d.counts) || {};
+        render();
+    }).catch(() => { /* calendar still works without counts */ });
 
     sync();
     render();

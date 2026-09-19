@@ -433,6 +433,24 @@ main.container { padding-top: 1.5rem; padding-bottom: 6rem; }
 .cal-day.is-outside { color: #cbd5e1; }
 .cal-day.in-range { background: var(--accent-soft); color: var(--accent); border-radius: 0; }
 .cal-day.is-edge { background: var(--accent); color: #fff; font-weight: 700; border-radius: 8px; }
+/* Days that already have album photos: soft green tint + count badge. */
+.cal-day.has-photos { background: #d9f5e6; }
+.cal-day.has-photos:hover { background: #bcead3; }
+.cal-day.has-photos.in-range { background: var(--accent-soft); }
+.cal-day.has-photos.is-edge { background: var(--accent); color: #fff; }
+.cal-count {
+  position: absolute;
+  bottom: 2px;
+  right: 3px;
+  font-size: 0.52rem;
+  font-style: normal;
+  font-weight: 700;
+  line-height: 1;
+  color: var(--green);
+  pointer-events: none;
+}
+.cal-day.in-range .cal-count { color: var(--accent); }
+.cal-day.is-edge .cal-count { color: rgba(255, 255, 255, 0.9); }
 .cal-day.is-today::after {
   content: "";
   position: absolute;

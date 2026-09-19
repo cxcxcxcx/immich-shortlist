@@ -604,6 +604,42 @@ def get_album_asset_ids(album_id):
     assets = data.get("assets") or []
     return {a.get("id") for a in assets if a.get("id")}
 
+
+# Per-day album photo counts for the home calendar ({"YYYY-MM-DD": count}),
+# cached briefly so the calendar can render counts without hammering Immich.
+_album_counts_cache: dict = {"at": 0.0, "counts": {}}
+_album_counts_lock = threading.Lock()
+
+
+def album_photo_counts(ttl_sec: float = 300.0) -> dict:
+    """Photos per capture day (local tz) currently in the Immich album."""
+    with _album_counts_lock:
+        if _album_counts_cache["counts"] and time.time() - _album_counts_cache["at"] < ttl_sec:
+            return _album_counts_cache["counts"]
+    from sync_immich_album_previews import _asset_datetime, _fetch_album_assets
+    try:
+        assets = _fetch_album_assets(IMMICH_URL, API_KEY, ALBUM_ID)
+    except requests.RequestException as exc:
+        print(f"Album counts fetch failed: {exc}")
+        return dict(_album_counts_cache["counts"])
+    counts: dict[str, int] = {}
+    for a in assets:
+        try:
+            day = _asset_datetime(a).astimezone(LOCAL_TZ).strftime("%Y-%m-%d")
+        except Exception:
+            continue
+        counts[day] = counts.get(day, 0) + 1
+    with _album_counts_lock:
+        _album_counts_cache.update(at=time.time(), counts=counts)
+    return counts
+
+
+@app.route('/api/album_counts')
+def api_album_counts():
+    """Per-day counts of photos already in the album, for the date picker."""
+    counts = album_photo_counts()
+    return jsonify({"counts": counts, "total": sum(counts.values()), "days": len(counts)})
+
 # ==========================================
 # 2. QUALITY & EXPRESSION EVALUATION (Aesthetics + MediaPipe Face Mesh)
 # ==========================================
