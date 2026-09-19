@@ -102,9 +102,12 @@
             if (s.dry_run) bits.push('DRY RUN');
             bits.push(fmtSecs(s.elapsed_sec || 0) + ' elapsed');
             text.textContent = bits.join(' — ');
-            planEl.textContent = (s.plan_add || s.plan_delete)
-                ? 'Plan: add ' + s.plan_add + ', delete ' + s.plan_delete +
-                  (s.delete ? ' (deletes ON)' : ' (deletes off)') + ' · storage ' + s.storage_id
+            planEl.textContent = (s.plan_add || s.plan_delete || s.base_url)
+                ? ((s.plan_add || s.plan_delete)
+                    ? 'Plan: add ' + s.plan_add + ', delete ' + s.plan_delete +
+                      (s.delete ? ' (deletes ON)' : ' (deletes off)')
+                    : 'Nothing to sync') +
+                  ' · storage ' + s.storage_id + ' · target ' + (s.base_url || '')
                 : '';
             setTimeout(poll, 1500);
         } else if (s.state === 'done' || s.state === 'cancelled') {

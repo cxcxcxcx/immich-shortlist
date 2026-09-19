@@ -1670,6 +1670,7 @@ def sync_job(storage_id: str, delete: bool, dry_run: bool) -> None:
                 albums=summary.get("albums") or {},
                 albums_error=summary.get("albums_error", ""),
                 storage_id=summary.get("storage_id") or SYNC_STATE["storage_id"],
+                base_url=summary.get("base_url") or SYNC_STATE.get("base_url", ""),
                 state="cancelled" if summary["cancelled"] else "done",
                 finished_at=time.time(),
             )

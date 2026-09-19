@@ -14,8 +14,10 @@ SYNC_OUT_ROOT = Path(
 LOCAL_TZ_NAME = os.environ.get("LOCAL_TZ", "America/Los_Angeles")
 
 # Pixtale gallery (see upload_to_pixtale.py / sync_album_to_pixtale.py).
+# Since 2026-09-18 the WRITER is the public instance (uploads land there
+# directly; its Qiniu fetches are domestic and fast) — local 8083 is retired.
 # No password here: it is read from PIXTALE_PASSWORD or ~/pixtale/.env at use
 # time (config can't import upload_to_pixtale — that would be circular).
-PIXTALE_URL = os.environ.get("PIXTALE_URL", "http://localhost:8083")
+PIXTALE_URL = os.environ.get("PIXTALE_URL", "https://zlhl-album.xiangyin.mobi")
 PIXTALE_USER = os.environ.get("PIXTALE_USER", "admin")
 PIXTALE_STORAGE_ID = os.environ.get("PIXTALE_STORAGE_ID", "")

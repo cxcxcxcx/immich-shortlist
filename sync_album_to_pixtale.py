@@ -358,6 +358,7 @@ def run_sync(
     client.immich_url = immich_url  # duck-typed attrs relied on by upload_asset
     client.immich_api_key = api_key
     result["storage_id"] = client.storage_id
+    result["base_url"] = client.base
     emit({
         "phase": "fetching_pixtale",
         "album_assets": len(assets),
@@ -475,7 +476,7 @@ def main() -> None:
     ap.add_argument("--immich-url", default=os.environ.get("IMMICH_URL", DEFAULT_IMMICH_URL))
     ap.add_argument("--api-key", default=os.environ.get("IMMICH_API_KEY", DEFAULT_API_KEY))
     ap.add_argument("--album-id", default=os.environ.get("IMMICH_ALBUM_ID", DEFAULT_ALBUM_ID))
-    ap.add_argument("--base-url", default=os.environ.get("PIXTALE_URL", "http://localhost:8083"))
+    ap.add_argument("--base-url", default=os.environ.get("PIXTALE_URL", "https://zlhl-album.xiangyin.mobi"))
     ap.add_argument("--username", default=os.environ.get("PIXTALE_USER", "admin"))
     ap.add_argument("--password", default=os.environ.get("PIXTALE_PASSWORD") or _read_default_password())
     ap.add_argument("--storage-id", default=os.environ.get("PIXTALE_STORAGE_ID"))
