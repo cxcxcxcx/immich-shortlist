@@ -70,20 +70,20 @@ ALBUM_OP_BATCH = 500
 def classify_source(exif: dict | None) -> str:
     """Bucket a photo into one of SOURCE_ALBUM_NAMES by its EXIF make/model.
 
-    相机 = real cameras (Canon), 幼儿园 = the old iPhone 12/14 era, 手机 =
-    recent iPhones (15+) plus Pixel/Galaxy, everything else (Ray-Ban glasses,
-    drones, iPads, unknown models, intermediate iPhones) -> 其它.
+    相机 = Canon cameras. 手机 = the family's own phones (exactly iPhone
+    12 Pro and iPhone 15 Pro) plus Galaxy/Pixel. 幼儿园 = every OTHER iPhone
+    (kindergarten-owned, e.g. 14 Pro / 15 Pro Max / 16 / 17). 其它 = the rest
+    (Ray-Ban glasses, drones, iPads, unknown models).
     """
     exif = exif or {}
     model = str(exif.get("Model") or "")
     make = str(exif.get("Make") or "")
     if "canon" in f"{make} {model}".lower():
         return "相机"
-    if model.startswith("iPhone 12") or model.startswith("iPhone 14"):
-        return "幼儿园"
-    match = re.match(r"iPhone (\d+)", model)
-    if (match and int(match.group(1)) >= 15) or "Galaxy" in model or "Pixel" in model:
+    if model in ("iPhone 12 Pro", "iPhone 15 Pro") or "Galaxy" in model or "Pixel" in model:
         return "手机"
+    if model.startswith("iPhone"):
+        return "幼儿园"
     return "其它"
 
 
