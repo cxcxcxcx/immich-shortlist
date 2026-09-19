@@ -1,0 +1,12 @@
+{
+  "IMMICH_URL": "http://localhost:2283",
+  "IMMICH_API_KEY": "your-immich-api-key",
+  "IMMICH_ALBUM_ID": "your-album-uuid",
+  "SYNC_OUT_ROOT": "/path/to/preview/sync/tree",
+  "LOCAL_TZ": "America/Los_Angeles",
+  "FACE_IDS": ["person-uuid-of-your-kid-1", "person-uuid-of-your-kid-2"],
+  "FAMILY_FACES": ["person-uuid-family-a", "person-uuid-family-b"],
+  "PIXTALE_URL": "http://localhost:8083",
+  "PIXTALE_USER": "admin",
+  "PIXTALE_STORAGE_ID": ""
+}

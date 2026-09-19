@@ -42,26 +42,18 @@ from flask import Flask, render_template, request, redirect, url_for, jsonify
 # ==========================================
 from config import IMMICH_URL, API_KEY, ALBUM_ID, LOCAL_TZ_NAME
 from config import PIXTALE_URL, PIXTALE_USER, PIXTALE_STORAGE_ID
+from config import FACE_IDS, FAMILY_FACES
 from sync_album_to_pixtale import run_sync, SYNC_CONCURRENCY
 from upload_to_pixtale import PixtaleClient, _read_default_password, default_storage_id
 
 # Local timezone used to interpret date boundaries (inclusive days).
 LOCAL_TZ = ZoneInfo(LOCAL_TZ_NAME)
 
-# List of Face/Person UUIDs to search for
-FACE_IDS = [
-    "aa79eb75-13ba-4a9f-8ee6-733606733577",
-    "42107bf5-8241-4780-8795-f654176e5b3c",
-]
-
-FAMILY_FACES = [
-    "3e00abfd-f940-4abb-a0b8-7b4b60a6ce66",
-    "2712e983-c68b-44cd-ac25-cea81edff32c",
-    "fb5339f7-fe52-4382-97a0-27dff719eae8",
-    "ea5e068a-3d4c-4bd6-8035-426749eaa2ed",
-    "a23eb31d-3ff8-44c9-a2ea-b90819646d24",
-    "8300f245-08e9-422d-8f90-96910cbd04bd",
-]
+# Seed lists of Immich Face/Person UUIDs (config.local.json / env: FACE_IDS,
+# FAMILY_FACES). They only seed DEFAULT_PARAMS below: once curation_params.json
+# exists the /settings page is the editor of record. Keep empty in code.
+FACE_IDS = [str(u) for u in FACE_IDS]
+FAMILY_FACES = [str(u) for u in FAMILY_FACES]
 
 # ==========================================
 # TUNABLE PARAMETERS (UI-editable via /settings)
@@ -2514,8 +2506,9 @@ if __name__ == "__main__":
     print(" Immich AI Album Curator ")
     print("========================================\n")
 
-    if API_KEY == "YOUR_API_KEY_HERE":
-        print("ERROR: Please update the API_KEY, IMMICH_URL, and ALBUM_ID variables inside the script first.")
+    if not API_KEY or not ALBUM_ID:
+        print("ERROR: IMMICH_API_KEY and IMMICH_ALBUM_ID are not configured.")
+        print("       Set them via environment or config.local.json (see config.py).")
         exit(1)
 
     if args.month:
