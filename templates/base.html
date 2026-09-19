@@ -3,13 +3,13 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}Photo Curator{% endblock %}</title>
+    <title>{% block title %}Shortlist{% endblock %}</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 <nav class="navbar">
     <div class="container navbar-inner">
-        <a class="brand" href="{{ url_for('index') }}"><span class="brand-dot"></span><span class="brand-name">Photo Curator</span></a>
+        <a class="brand" href="{{ url_for('index') }}"><span class="brand-dot"></span><span class="brand-name">Shortlist</span></a>
         <div class="nav-links">
             <a href="{{ url_for('index') }}" class="{{ 'active' if active_page == 'home' }}"><span class="nl-full">New run</span><span class="nl-short">Run</span></a>
             <a href="{{ url_for('top') }}" class="{{ 'active' if active_page == 'top' }}"><span class="nl-full">Top picks</span><span class="nl-short">Top</span></a>

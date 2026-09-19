@@ -2503,7 +2503,7 @@ if __name__ == "__main__":
         _run_job_child(args.run_job)  # never returns
 
     print("========================================")
-    print(" Immich AI Album Curator ")
+    print(" Shortlist — family-photo curation for Immich ")
     print("========================================\n")
 
     if not API_KEY or not ALBUM_ID:

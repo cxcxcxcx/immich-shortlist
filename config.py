@@ -1,5 +1,5 @@
 """
-Deployment configuration for photo_highlights scripts.
+Deployment configuration for Shortlist (immich-shortlist).
 
 No site-specific values live in code. Each setting resolves as:
 

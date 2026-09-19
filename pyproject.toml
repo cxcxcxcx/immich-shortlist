@@ -1,7 +1,7 @@
 [project]
-name = "photo-highlights"
+name = "immich-shortlist"
 version = "0.1.0"
-description = "Self-hosted family-photo curation on top of Immich: local ML ranking (quality, expression, moments), human-in-the-loop selection, optional Pixtale gallery sync."
+description = "Shortlist is a companion app for Immich that automates family-photo curation with a human in the loop: local ML ranking (quality, expression, moments), selections written back to an Immich album, optional sync to a Pixtale gallery."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

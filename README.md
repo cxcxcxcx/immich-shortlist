@@ -1,26 +1,46 @@
-# Photo Curator
+# Shortlist
 
+**Automated family-photo curation for [Immich](https://immich.app) — final say yours.**
 [中文说明](README.zh-CN.md)
 
-A self-hosted workflow that turns tens of thousands of family photos in
-[Immich](https://immich.app) into a small, hand-picked album of the moments
-worth sharing — automatically ranked, finally chosen by you.
+Shortlist is a companion app for Immich that ranks the month's thousands of
+frames into a shortlist of keepers per day and hands you the checkbox. It sits
+beside your existing Immich server (never replaces or forks it), writes your
+selections **back into an Immich album**, and can optionally sync that album to
+a shareable [Pixtale](https://github.com/aslost/pixtale) gallery.
 
 ![Curation run — the date picker](docs/home.png)
 
 ## Why
 
-Phone cameras produce tens of thousands of frames: blurry duplicates,
-near-identical bursts, and "what was this even for" photos. Google Photos'
-highlight reels don't know our kids, don't rank smiles the way we do, and —
-for a lot of the families we share with — aren't reachable at all. We wanted a
-pipeline that:
+Immich is superb at keeping and finding photos once you know what you're
+looking for. It is not built to answer the question that actually hurts:
 
-1. **knows whose faces matter** (our kids first, the rest of the family second),
-2. **picks one great frame per moment**, not 30 similar ones,
-3. **keeps a human in the loop** — the tool proposes, we submit,
-4. **publishes to a gallery family members in China can actually open** — no
-   Google account, no VPN.
+> *"I took 3,000 photos of the kids this month — which 20 are worth keeping and
+> sharing?"*
+
+Immich de-duplicates and recognizes faces, but it won't rank a burst by who's
+smiling and looking at the camera, collapse 30 near-identical frames into the
+one good moment, or hand you a curated shortlist to say yes/no on. Google
+Photos does surface highlights, but its reels don't know *our* kids, don't
+score the faces we care about, and — for the family members we most want to
+share with, back in China — **can't be opened at all** without a Google account
+and a VPN.
+
+So we built the missing layer: **automated curation with a human in the loop.**
+The machine does the tedious part (search, score, cluster, propose); you do the
+one only you can (pick the shots with meaning). The results flow back into
+Immich, which stays the single source of truth — a Shortlist album is just
+an Immich album, so nothing is locked away. And when you do want relatives to
+see it, a push to a self-hosted Pixtale gallery gives them a link that works in
+Shanghai or Shenzhen.
+
+Concretely, it aims to:
+
+1. **know whose faces matter** — your kids first, the rest of the family second,
+2. **propose one great frame per moment**, not 30 look-alikes,
+3. **keep you in charge** — it shortlists, you approve, and it writes back to Immich,
+4. **publish somewhere family in China can actually open** — no Google, no VPN.
 
 ## How it works
 
