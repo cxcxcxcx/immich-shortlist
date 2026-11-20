@@ -26,9 +26,17 @@
         return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
     }
     function fromIso(s) { return new Date(s + 'T00:00:00'); }
-    function addDays(d, n) { return new Date(d.getTime() + n * DAY_MS); }
+    // Calendar-day arithmetic, not millisecond arithmetic: adding 86400000 ms
+    // across a DST change lands on 23:00 the same day (or 01:00 the next),
+    // which duplicated/shifted dates in the grid.
+    function addDays(d, n) { const x = new Date(d); x.setDate(x.getDate() + n); return x; }
+    function dayDiff(a, b) {
+        const ua = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+        const ub = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+        return Math.round((ub - ua) / DAY_MS);
+    }
     function sameDay(a, b) { return a !== null && b !== null && iso(a) === iso(b); }
-    function daysCount(a, b) { return Math.round((startOfDay(b) - startOfDay(a)) / DAY_MS) + 1; }
+    function daysCount(a, b) { return dayDiff(a, b) + 1; }
     function fmtHuman(d) { return MONTHS[d.getMonth()].slice(0, 3) + ' ' + d.getDate() + ', ' + d.getFullYear(); }
     function monthEnd(y, m) { return new Date(y, m + 1, 0); }
 
@@ -75,11 +83,11 @@
 
     function monthGrid(y, m) {
         const first = new Date(y, m, 1);
-        const gridStart = addDays(first, -((first.getDay() + 6) % 7)); // back to Monday
+        const offset = (first.getDay() + 6) % 7; // week starts on Monday
         let html = '<div class="cal-month"><div class="cal-month-label">' + MONTHS[m] + ' ' + y + '</div><div class="cal-grid">';
         for (const d of DOW) html += '<div class="cal-dow">' + d + '</div>';
         for (let i = 0; i < 42; i++) {
-            const d = addDays(gridStart, i);
+            const d = new Date(y, m, 1 - offset + i);
             const n = albumCounts[iso(d)] || 0;
             const badge = n ? '<i class="cal-count">' + (n > 99 ? '99+' : n) + '</i>' : '';
             html += '<button type="button" class="' + cellClass(d, first, monthEnd(y, m)) +

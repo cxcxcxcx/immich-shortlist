@@ -408,6 +408,7 @@ main.container { padding-top: 1.5rem; padding-bottom: 6rem; }
 .cal-months { display: grid; grid-template-columns: 1fr; gap: 1.25rem; }
 @media (min-width: 720px) { .cal-months { grid-template-columns: 1fr 1fr; } }
 .cal-month-label { font-size: 0.8rem; font-weight: 600; color: var(--text-2); text-align: center; margin: 0.2rem 0 0.4rem; }
+@media (max-width: 719px) { .cal-month-label { display: none; } } /* toolbar already names the month */
 .cal-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px; }
 .cal-dow {
   font-size: 0.65rem;
