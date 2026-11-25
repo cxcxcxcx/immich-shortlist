@@ -40,9 +40,11 @@ from flask import Flask, render_template, request, redirect, url_for, jsonify
 # ==========================================
 # CONFIGURATION
 # ==========================================
-from config import IMMICH_URL, API_KEY, ALBUM_ID, LOCAL_TZ_NAME
+from config import IMMICH_URL, API_KEY, ALBUM_ID, LOCAL_TZ_NAME, DATA_DIR, PORT
 from config import PIXTALE_URL, PIXTALE_USER, PIXTALE_STORAGE_ID
 from config import FACE_IDS, FAMILY_FACES
+
+os.makedirs(DATA_DIR, exist_ok=True)
 from sync_album_to_pixtale import run_sync, SYNC_CONCURRENCY
 from upload_to_pixtale import PixtaleClient, _read_default_password, default_storage_id
 
@@ -100,7 +102,7 @@ DEFAULT_PARAMS: dict = {
     "family_faces": list(FAMILY_FACES),
 }
 
-PARAMS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_params.json")
+PARAMS_PATH = os.path.join(DATA_DIR, "curation_params.json")
 
 # Spec table driving both validation and the settings form rendering.
 PARAM_SPECS: dict[str, dict] = {
@@ -285,14 +287,20 @@ def save_params() -> None:
 
 
 # Flask app configuration
-FLASK_PORT = 5724
+FLASK_PORT = PORT
 
-# MediaPipe face landmarker model (Tasks API). You must download this file
-# from the official MediaPipe model zoo and place it here.
-# Example URL (float32 variant):
-# https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float32/1/face_landmarker.task
-FACE_LANDMARKER_MODEL_PATH = os.path.join(
-    os.path.dirname(__file__), "face_landmarker.task"
+# MediaPipe face landmarker model (Tasks API). Looked up next to the script
+# first (e.g. baked into the Docker image or manually downloaded), then in
+# DATA_DIR; downloaded automatically on first use if missing.
+FACE_LANDMARKER_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_landmarker/"
+    "face_landmarker/float16/1/face_landmarker.task"
+)
+_APP_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "face_landmarker.task")
+FACE_LANDMARKER_MODEL_PATH = (
+    _APP_MODEL_PATH
+    if os.path.exists(_APP_MODEL_PATH)
+    else os.path.join(DATA_DIR, "face_landmarker.task")
 )
 
 # ==========================================
@@ -363,7 +371,7 @@ SYNC_CANCEL = threading.Event()
 _pixtale_storage_cache: dict | None = None  # {"fetched_at": float, "storages": [...]}
 _pixtale_storage_lock = threading.Lock()
 # On-disk checkpoint of curation results, so restarts don't lose them.
-CHECKPOINT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_checkpoint.json")
+CHECKPOINT_PATH = os.path.join(DATA_DIR, "curation_checkpoint.json")
 _checkpoint_info: dict | None = None
 
 
@@ -426,7 +434,7 @@ def discard_checkpoint() -> None:
 # image, so they are reusable across runs and date ranges; only new assets
 # pay inference cost again. Bump the version when models or preprocessing
 # change.
-FEATURE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feature_cache.json")
+FEATURE_CACHE_PATH = os.path.join(DATA_DIR, "feature_cache.json")
 # v2 adds per-face raw rows ("faces") so expression/family scores can be
 # re-aggregated under new params or face sets without re-running MediaPipe.
 # v1 files are still accepted: entries without "faces" are backfilled lazily.
@@ -655,10 +663,15 @@ def _get_face_landmarker():
     if _face_landmarker is not None:
         return _face_landmarker
     if not os.path.exists(FACE_LANDMARKER_MODEL_PATH):
-        raise RuntimeError(
-            f"Face Landmarker model not found at {FACE_LANDMARKER_MODEL_PATH}. "
-            "Download face_landmarker.task from the MediaPipe model zoo and place it there."
-        )
+        print(f"Downloading MediaPipe face landmarker model to {FACE_LANDMARKER_MODEL_PATH}...")
+        resp = requests.get(FACE_LANDMARKER_MODEL_URL, stream=True, timeout=120)
+        resp.raise_for_status()
+        tmp = FACE_LANDMARKER_MODEL_PATH + ".tmp"
+        with open(tmp, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=1024 * 64):
+                if chunk:
+                    f.write(chunk)
+        os.replace(tmp, FACE_LANDMARKER_MODEL_PATH)
     from mediapipe.tasks import python as mp_python
     from mediapipe.tasks.python import vision as mp_vision
 
@@ -1787,10 +1800,10 @@ def checkpoint_discard():
 # handing all of that memory back to the OS. The parent keeps a watcher
 # thread that mirrors the child's progress file into CURATION_STATE for
 # /progress, and reloads results from the checkpoint when it finishes.
-JOB_REQUEST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job.json")
-JOB_STATUS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job_status.json")
-JOB_CANCEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job_cancel")
-JOB_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "curation_job.log")
+JOB_REQUEST_PATH = os.path.join(DATA_DIR, "curation_job.json")
+JOB_STATUS_PATH = os.path.join(DATA_DIR, "curation_job_status.json")
+JOB_CANCEL_PATH = os.path.join(DATA_DIR, "curation_job_cancel")
+JOB_LOG_PATH = os.path.join(DATA_DIR, "curation_job.log")
 _CURATION_PROC: subprocess.Popen | None = None
 _JOB_START_LOCK = threading.Lock()
 _STATUS_LOCK = threading.Lock()  # dumper thread + job finally both write the status file
@@ -2535,5 +2548,6 @@ if __name__ == "__main__":
 
     # FLASK_RELOADER=0 runs a single process: the reloader's supervisor process
     # otherwise keeps a full second copy of the imports alive (~0.65 GB idle).
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=True,
-            use_reloader=os.environ.get("FLASK_RELOADER", "1") != "0")
+    debug = os.environ.get("FLASK_DEBUG", "1") != "0"
+    app.run(host="0.0.0.0", port=FLASK_PORT, debug=debug,
+            use_reloader=debug and os.environ.get("FLASK_RELOADER", "1") != "0")

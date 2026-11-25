@@ -16,11 +16,18 @@ would be circular).
 import json
 import os
 
-_LOCAL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.local.json")
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR") or _APP_DIR
+
 _local: dict = {}
-if os.path.isfile(_LOCAL_PATH):
-    with open(_LOCAL_PATH) as f:
-        _local = json.load(f)
+for _candidate in (
+    os.path.join(_APP_DIR, "config.local.json"),
+    os.path.join(DATA_DIR, "config.local.json"),
+):
+    if os.path.isfile(_candidate):
+        with open(_candidate) as f:
+            _local = json.load(f)
+        break
 
 
 def _setting(env: str, key: str | None = None, default=None):
@@ -31,6 +38,15 @@ def _setting(env: str, key: str | None = None, default=None):
     return _local.get(key or env, default)
 
 
+def _list_setting(env: str, key: str | None = None, default=None) -> list:
+    """Like _setting, but parses comma-separated env strings into a list."""
+    value = _setting(env, key=key, default=default if default is not None else [])
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return list(value) if value else []
+
+
+PORT = int(_setting("PORT", default=5724))
 IMMICH_URL = _setting("IMMICH_URL", default="http://localhost:2283")
 API_KEY = _setting("IMMICH_API_KEY", default="")
 ALBUM_ID = _setting("IMMICH_ALBUM_ID", default="")
@@ -39,10 +55,15 @@ LOCAL_TZ_NAME = _setting("LOCAL_TZ", "LOCAL_TZ_NAME", default="America/Los_Angel
 
 # Immich person UUIDs used to seed the scoring params (the /settings page is
 # the editor of record afterwards; these are just the initial face sets).
-FACE_IDS = _setting("FACE_IDS", default=[])
-FAMILY_FACES = _setting("FAMILY_FACES", default=[])
+FACE_IDS = _list_setting("FACE_IDS", default=[])
+FAMILY_FACES = _list_setting("FAMILY_FACES", default=[])
 
 # Pixtale gallery (password deliberately absent; see module docstring).
 PIXTALE_URL = _setting("PIXTALE_URL", default="http://localhost:8083")
 PIXTALE_USER = _setting("PIXTALE_USER", default="admin")
 PIXTALE_STORAGE_ID = _setting("PIXTALE_STORAGE_ID", default="")
+
+# Optional EXIF-based source-album rules for sync_album_to_pixtale.py.
+# Empty by default (disabled). Example in config.local.json:
+# [{"album": "Camera", "make_contains": ["canon"]}, {"album": "Other", "default": true}]
+PIXTALE_SOURCE_ALBUMS = _local.get("PIXTALE_SOURCE_ALBUMS", [])

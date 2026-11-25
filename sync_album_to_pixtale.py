@@ -47,7 +47,13 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from config import ALBUM_ID as DEFAULT_ALBUM_ID, API_KEY as DEFAULT_API_KEY, IMMICH_URL as DEFAULT_IMMICH_URL
+from config import (
+    ALBUM_ID as DEFAULT_ALBUM_ID,
+    API_KEY as DEFAULT_API_KEY,
+    IMMICH_URL as DEFAULT_IMMICH_URL,
+    PIXTALE_SOURCE_ALBUMS,
+    PIXTALE_URL as DEFAULT_PIXTALE_URL,
+)
 from sync_immich_album_previews import (
     _asset_datetime,
     _attach_exif_json,
@@ -60,31 +66,34 @@ from upload_to_pixtale import PixtaleClient, _read_default_password
 DELETE_BATCH = 50
 LIST_PAGE_SIZE = 500
 
-# Source albums: after every sync every photo is placed into exactly one of
-# these albums based on its EXIF camera model, so viewers can browse by
-# capture device. Order matters only for display.
-SOURCE_ALBUM_NAMES = ("相机", "幼儿园", "手机", "其它")
+# Optional EXIF-based source albums (configured via PIXTALE_SOURCE_ALBUMS in
+# config.local.json). When empty, source-album classification is skipped.
 ALBUM_OP_BATCH = 500
 
 
-def classify_source(exif: dict | None) -> str:
-    """Bucket a photo into one of SOURCE_ALBUM_NAMES by its EXIF make/model.
-
-    相机 = Canon cameras. 手机 = the family's own phones (exactly iPhone
-    12 Pro and iPhone 15 Pro) plus Galaxy/Pixel. 幼儿园 = every OTHER iPhone
-    (kindergarten-owned, e.g. 14 Pro / 15 Pro Max / 16 / 17). 其它 = the rest
-    (Ray-Ban glasses, drones, iPads, unknown models).
-    """
+def classify_source(exif: dict | None, rules: list[dict] | None = None) -> str | None:
+    """Match a photo's EXIF make/model against ordered PIXTALE_SOURCE_ALBUMS rules."""
+    rules = PIXTALE_SOURCE_ALBUMS if rules is None else rules
     exif = exif or {}
     model = str(exif.get("Model") or "")
     make = str(exif.get("Make") or "")
-    if "canon" in f"{make} {model}".lower():
-        return "相机"
-    if model in ("iPhone 12 Pro", "iPhone 15 Pro") or "Galaxy" in model or "Pixel" in model:
-        return "手机"
-    if model.startswith("iPhone"):
-        return "幼儿园"
-    return "其它"
+    combined = f"{make} {model}".lower()
+
+    for rule in rules:
+        album = rule.get("album")
+        if not album:
+            continue
+        if rule.get("default"):
+            return album
+        if any(s.lower() in combined for s in rule.get("make_or_model_contains", [])):
+            return album
+        if model in rule.get("model_in", []):
+            return album
+        if any(s in model for s in rule.get("model_contains", [])):
+            return album
+        if any(model.startswith(p) for p in rule.get("model_prefix", [])):
+            return album
+    return None
 
 
 def _list_all_rows(client: PixtaleClient, album_id: str | None = None) -> list[dict]:
@@ -130,13 +139,16 @@ def _album_op(client: PixtaleClient, path: str, body: dict) -> None:
 
 def maintain_source_albums(client: PixtaleClient, apply: bool = True) -> dict:
     """
-    Reconcile the four source albums against EXIF classification.
+    Reconcile optional EXIF-based source albums (configured via PIXTALE_SOURCE_ALBUMS).
 
-    With apply=False this only computes the plan (used by --dry-run). Writes are
-    idempotent: missing albums are created, photos are added to / removed from
-    albums in diffs, so every photo ends up in exactly one album.
+    Returns {} when no rules are configured. With apply=False this only computes
+    the plan (used by --dry-run). Writes are idempotent: missing albums are
+    created and photos are added/removed in diffs.
     """
-    desired: dict[str, list[str]] = {name: [] for name in SOURCE_ALBUM_NAMES}
+    album_names = [r["album"] for r in PIXTALE_SOURCE_ALBUMS if r.get("album")]
+    if not album_names:
+        return {}
+    desired: dict[str, list[str]] = {name: [] for name in album_names}
     for row in _list_all_rows(client):
         try:
             exif = json.loads(row.get("exif") or "{}")
@@ -146,14 +158,16 @@ def maintain_source_albums(client: PixtaleClient, apply: bool = True) -> dict:
             exif = {}
         photo_id = str(row.get("photoId") or "")
         if photo_id:
-            desired[classify_source(exif)].append(photo_id)
+            target = classify_source(exif)
+            if target in desired:
+                desired[target].append(photo_id)
 
     albums = client.session.post(f"{client.base}/api/album/list", json={}, timeout=30).json()
     if albums.get("code") != 200:
         raise RuntimeError(f"/api/album/list -> {albums.get('message') or albums}")
     by_name = {a["name"]: a["albumId"] for a in albums.get("data") or [] if a.get("name")}
     plan: dict[str, dict] = {}
-    for name in SOURCE_ALBUM_NAMES:
+    for name in album_names:
         album_id = by_name.get(name)
         if apply and album_id is None:
             _album_op(client, "add", {"name": name, "description": ""})
@@ -476,7 +490,7 @@ def main() -> None:
     ap.add_argument("--immich-url", default=os.environ.get("IMMICH_URL", DEFAULT_IMMICH_URL))
     ap.add_argument("--api-key", default=os.environ.get("IMMICH_API_KEY", DEFAULT_API_KEY))
     ap.add_argument("--album-id", default=os.environ.get("IMMICH_ALBUM_ID", DEFAULT_ALBUM_ID))
-    ap.add_argument("--base-url", default=os.environ.get("PIXTALE_URL", "https://zlhl-album.xiangyin.mobi"))
+    ap.add_argument("--base-url", default=os.environ.get("PIXTALE_URL", DEFAULT_PIXTALE_URL))
     ap.add_argument("--username", default=os.environ.get("PIXTALE_USER", "admin"))
     ap.add_argument("--password", default=os.environ.get("PIXTALE_PASSWORD") or _read_default_password())
     ap.add_argument("--storage-id", default=os.environ.get("PIXTALE_STORAGE_ID"))

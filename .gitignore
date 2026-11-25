@@ -34,3 +34,6 @@ pixtale/
 
 # Site-specific config (copy config.local.json.example to create it)
 config.local.json
+
+# Docker Compose runtime data volume
+data/

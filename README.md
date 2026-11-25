@@ -9,7 +9,7 @@ beside your existing Immich server (never replaces or forks it), writes your
 selections **back into an Immich album**, and can optionally sync that album to
 a shareable [Pixtale](https://github.com/aslost/pixtale) gallery.
 
-![Curation run — the date picker](docs/home.png)
+![Daily top picks — scored & clustered shortlist](docs/top.png)
 
 ## Why
 
@@ -44,7 +44,11 @@ Concretely, it aims to:
 
 ## How it works
 
-You run an analysis over a date range (pick it on a calendar). For each day:
+You run an analysis over a date range (pick it on a calendar):
+
+![Curation run — the date picker](docs/home.png)
+
+For each day:
 
 - **Search** — every photo Immich has face-tagged as one of your *primary
   people* (your kids) on that date becomes a candidate.
@@ -91,28 +95,43 @@ third-party API keys, no telemetry.
 
 ## Setup
 
-Requires Python ≥ 3.13 and a running Immich server with face recognition
-enabled and your family's people created (the settings page browses them by
-name — person UUIDs never need to be typed by hand).
+Requires a running Immich server with face recognition enabled and your family's
+people created (the `/settings` page lets you browse and pick them by name —
+person UUIDs never need to be typed by hand).
+
+### Option 1: Docker Compose (recommended)
 
 ```bash
-# 1. Install dependencies (uv)
+git clone https://github.com/cxcxcxcx/immich-shortlist.git
+cd immich-shortlist
+# Edit docker-compose.yml with your IMMICH_URL, IMMICH_API_KEY, IMMICH_ALBUM_ID, and LOCAL_TZ
+docker compose up -d --build
+```
+
+Open `http://localhost:5724`, visit **Settings** to pick your primary & family
+faces, and start your first curation run. The `./data` volume persists your
+settings, feature cache, checkpoints, and downloaded model weights across
+restarts. The image uses CPU-only PyTorch and pre-bakes MediaPipe's
+`face_landmarker.task` model.
+
+### Option 2: Local Python (`uv`)
+
+Requires Python ≥ 3.13:
+
+```bash
+# 1. Install dependencies
 uv sync
 
-# 2. Face-landmark model (MediaPipe's public model zoo)
-curl -L -o face_landmarker.task \
-  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float32/1/face_landmarker.task
-
-# 3. Configure — copy the example and fill in your values
+# 2. Configure — copy the example and fill in your values
 cp config.local.json.example config.local.json
 
-# 4. Run
+# 3. Run (face_landmarker.task is downloaded automatically on first use)
 uv run python daily_highlights.py     # UI on http://localhost:5724
 ```
 
 Everything site-specific lives in `config.local.json` (gitignored) or the
 matching environment variables (which win): Immich URL / API key / album ID,
-the face-set seed lists, timezone, and the pixtale endpoint. The first
+the face-set seed lists, timezone, and the optional Pixtale endpoint. The first
 curation run pays a one-time ~10 s ML import; each job afterwards runs in a
 short-lived worker subprocess so gigabytes of model memory return to the OS
 when it exits.
@@ -121,6 +140,8 @@ Headless mode is available for cron-style monthly runs:
 
 ```bash
 uv run python daily_highlights.py --month 2026-04 --skip-in-album
+# or via Docker:
+docker compose run --rm shortlist python daily_highlights.py --month 2026-04 --skip-in-album
 ```
 
 ## Tuning what "best" means
@@ -131,6 +152,12 @@ facing, separately for primary and family faces), cluster similarity
 threshold, max moments per day, and the default-selection floor. If the
 tool's taste and your taste diverge, that's a settings conversation, not a
 code change.
+
+## Project status
+
+Shortlist is a personal tool built for my own family's Immich library and shared
+as-is under the MIT license. Issues and PRs are welcome, though maintenance
+follows my own family's needs.
 
 ## License
 

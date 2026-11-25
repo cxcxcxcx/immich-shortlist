@@ -8,7 +8,7 @@ Shortlist 是一个 **Immich 的配套应用**：把一个月里成千上万张�
 你勾选后**回写进一个 Immich 相册**——还能一键同步到可分享的
 [Pixtale](https://github.com/aslost/pixtale) 相册。
 
-![精选运行 — 日历选日期](docs/home.png)
+![每日精选 — 自动打分与聚类候选](docs/top.png)
 
 ## 为什么要做这个
 
@@ -37,7 +37,11 @@ Immich 相册，什么都不会被困住。想让亲戚看看时，一键同步�
 
 ## 它是怎么工作的
 
-在日历上选一个日期区间，逐日分析：
+在日历上选一个日期区间：
+
+![精选运行 — 日历选日期](docs/home.png)
+
+逐日分析：
 
 - **检索**——把当天被 Immich 标记为"主要人物"（自家孩子）出现过的照片，
   全部列为候选。
@@ -77,26 +81,40 @@ Immich 相册，什么都不会被困住。想让亲戚看看时，一键同步�
 
 ## 安装
 
-需要 Python ≥ 3.13，以及一个已开启人脸识别、且已建好家人物（people）的 Immich 服务器
-（设置页能按名字浏览人物——**不用手抄任何 UUID**）。
+需要一个已开启人脸识别、且已建好家人人物（people）的 Immich 服务器
+（`/settings` 设置页能按名字浏览和勾选人物——**不用手抄任何 UUID**）。
+
+### 方式一：Docker Compose（推荐）
 
 ```bash
-# 1. 安装依赖（uv）
+git clone https://github.com/cxcxcxcx/immich-shortlist.git
+cd immich-shortlist
+# 编辑 docker-compose.yml，填入 IMMICH_URL、IMMICH_API_KEY、IMMICH_ALBUM_ID 和 LOCAL_TZ
+docker compose up -d --build
+```
+
+打开 `http://localhost:5724`，先到 **Settings** 页面选好主要人物和其他家人，
+就能开始第一次精选。`./data` 挂载卷会在容器重建后保留你的参数、特征缓存、断点记录
+和已下载的模型权重。镜像默认使用 CPU 版 PyTorch，并已内置 MediaPipe 的
+`face_landmarker.task` 模型。
+
+### 方式二：本地 Python（`uv`）
+
+需要 Python ≥ 3.13：
+
+```bash
+# 1. 安装依赖
 uv sync
 
-# 2. 下载人脸关键点模型（MediaPipe 官方模型库）
-curl -L -o face_landmarker.task \
-  https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float32/1/face_landmarker.task
-
-# 3. 配置——复制示例并填入你的值
+# 2. 配置——复制示例并填入你的值
 cp config.local.json.example config.local.json
 
-# 4. 运行
+# 3. 运行（首次使用会自动下载 face_landmarker.task 模型）
 uv run python daily_highlights.py     # 界面在 http://localhost:5724
 ```
 
 所有跟具体部署相关的值都放在 `config.local.json`（已被 gitignore）或对应的环境变量里
-（环境变量优先）：Immich 地址 / API key / 相册 ID、人物名单、时区、Pixtale 地址。
+（环境变量优先）：Immich 地址 / API key / 相册 ID、人物名单、时区、可选的 Pixtale 地址。
 第一次跑精选会付一次约 10 秒的模型加载；此后每个任务都在一个用完即退的子进程里跑，
 几 GB 的模型内存会在任务结束时还给操作系统。
 
@@ -104,6 +122,8 @@ uv run python daily_highlights.py     # 界面在 http://localhost:5724
 
 ```bash
 uv run python daily_highlights.py --month 2026-04 --skip-in-album
+# 或通过 Docker：
+docker compose run --rm shortlist python daily_highlights.py --month 2026-04 --skip-in-album
 ```
 
 ## 调教它眼中的"最好"
@@ -112,6 +132,11 @@ uv run python daily_highlights.py --month 2026-04 --skip-in-album
 表情各分量的权重（睁眼 / 微笑 / 看镜头，主要人物和其他家人可分别设置）、
 聚类的相似度阈值、每天最多留几个瞬间、预选的分数下限。
 如果它的品味和你的对不上，那是设置页里能谈的事，不用改代码。
+
+## 关于维护
+
+Shortlist 最初是为自家 Immich 照片库写的自用工具，按 MIT 协议原样开源分享。
+欢迎提 Issue 和 PR，但维护节奏会以自家需求为主。
 
 ## 许可
 

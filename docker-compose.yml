@@ -1,0 +1,31 @@
+services:
+  shortlist:
+    build: .
+    container_name: immich-shortlist
+    restart: unless-stopped
+    ports:
+      - "5724:5724"
+    volumes:
+      # Stores curation_params.json, feature_cache.json, curation_checkpoint.json,
+      # and cached HuggingFace / PyTorch model weights across container restarts.
+      - ./data:/data
+    environment:
+      # Required: your Immich server URL, API key, and target album UUID
+      IMMICH_URL: "http://host.docker.internal:2283"
+      IMMICH_API_KEY: "your-immich-api-key"
+      IMMICH_ALBUM_ID: "your-album-uuid"
+
+      # Local timezone used for day boundaries (inclusive date ranges)
+      LOCAL_TZ: "America/Los_Angeles"
+
+      # Optional: seed person UUIDs (you can also pick faces visually in /settings)
+      # FACE_IDS: "person-uuid-kid-1,person-uuid-kid-2"
+      # FAMILY_FACES: "person-uuid-family-1,person-uuid-family-2"
+
+      # Optional: Pixtale gallery sync
+      # PIXTALE_URL: "https://gallery.example.com"
+      # PIXTALE_USER: "admin"
+      # PIXTALE_PASSWORD: "your-pixtale-password"
+      # PIXTALE_STORAGE_ID: ""
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
